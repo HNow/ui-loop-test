@@ -1,0 +1,39 @@
+{
+  "components": [
+    {
+      "id": "comp_1774658770320_mgk2ll",
+      "name": "sku-card-tray",
+      "status": "initial",
+      "iteration_count": 0,
+      "best_ssim": null,
+      "updated_at": "2026-03-28T00:46:10.320Z"
+    },
+    {
+      "id": "comp_1774659044_8938",
+      "name": "flat-skeuomorphic",
+      "status": "iterating",
+      "iteration_count": 1,
+      "best_ssim": null,
+      "created_at": "2026-03-27T20:50:44.829436",
+      "updated_at": "2026-03-27T20:55:00.000000"
+    },
+    {
+      "id": "comp_1774669240_6235",
+      "name": "FlatSkuMorphic",
+      "status": "initial",
+      "iteration_count": 0,
+      "best_ssim": null,
+      "created_at": "2026-03-27T23:40:40.479732",
+      "updated_at": "2026-03-27T23:40:40.479735"
+    },
+    {
+      "id": "comp_1774698443_3081",
+      "name": "BookingConfirmation",
+      "status": "iterating",
+      "iteration_count": 9,
+      "best_ssim": 0,
+      "created_at": "2026-03-28T07:47:23.933143",
+      "updated_at": "2026-03-28T10:02:12.620625"
+    }
+  ]
+}

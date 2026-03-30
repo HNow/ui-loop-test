@@ -1,0 +1,20 @@
+{
+  "name": "ui-loop-test",
+  "version": "0.0.1",
+  "private": true,
+  "scripts": {
+    "dev": "vite dev",
+    "build": "vite build",
+    "preview": "vite preview"
+  },
+  "devDependencies": {
+    "@sveltejs/adapter-auto": "^3.0.0",
+    "@sveltejs/kit": "^2.0.0",
+    "svelte": "^5.0.0",
+    "vite": "^8.0.3"
+  },
+  "type": "module",
+  "dependencies": {
+    "@sveltejs/vite-plugin-svelte": "^7.0.0"
+  }
+}

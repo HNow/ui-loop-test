@@ -1,0 +1,9 @@
+mcp[cli]
+playwright
+scikit-image
+pillow
+numpy
+scikit-learn
+requests
+openai
+uvicorn
