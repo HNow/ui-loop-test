@@ -15,6 +15,7 @@
   },
   "type": "module",
   "dependencies": {
-    "@sveltejs/vite-plugin-svelte": "^7.0.0"
+    "@sveltejs/vite-plugin-svelte": "^7.0.0",
+    "dotenv": "^17.3.1"
   }
 }

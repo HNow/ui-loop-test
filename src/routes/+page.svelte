@@ -74,9 +74,12 @@
       <h1>UI Cloner</h1>
       <p class="sub">Clone UI components from reference screenshots</p>
     </div>
-    <button class="new-btn" onclick={() => showNewModal = true}>
-      + New Component
-    </button>
+    <div class="header-actions">
+      <a href="/test" class="test-btn">🔬 Feature Testing</a>
+      <button class="new-btn" onclick={() => showNewModal = true}>
+        + New Component
+      </button>
+    </div>
   </header>
 
   <main>
@@ -116,7 +119,9 @@
 </div>
 
 {#if showNewModal}
-  <div class="modal-overlay" onclick={() => showNewModal = false}>
+  <!-- svelte-ignore a11y_click_events_have_key_events a11y_no_static_element_interactions -->
+  <div class="modal-overlay" role="dialog" aria-modal="true" onclick={() => showNewModal = false}>
+    <!-- svelte-ignore a11y_click_events_have_key_events a11y_no_static_element_interactions -->
     <div class="modal" onclick={(e) => e.stopPropagation()}>
       <h2>New Component</h2>
       <label>
@@ -181,6 +186,28 @@
 
   .new-btn:hover {
     background: #2563eb;
+  }
+
+  .header-actions {
+    display: flex;
+    gap: 0.75rem;
+    align-items: center;
+  }
+
+  .test-btn {
+    color: #888;
+    text-decoration: none;
+    padding: 0.6rem 1.25rem;
+    border: 1px solid #333;
+    border-radius: 8px;
+    font-size: 0.9rem;
+    transition: all 0.15s;
+  }
+
+  .test-btn:hover {
+    color: #e2e2e8;
+    border-color: #555;
+    background: rgba(255, 255, 255, 0.05);
   }
 
   .components {

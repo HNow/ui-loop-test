@@ -1,213 +1,123 @@
 ---
 name: ui-cloner
-description: Clone UI components from reference screenshots. Creates Svelte components with live preview, iteration history, and visual diff tracking.
-version: 3.0.0
+description: Clone UI components from reference screenshots using a DesignCoder-inspired 3-phase hierarchy-aware pipeline. Generates plain CSS (no Tailwind).
+version: 4.0.0
 ---
 
 # UI Cloner
 
-Clone a reference UI screenshot into a component with live preview and full iteration history.
+Clone a reference UI screenshot into an HTML component using a hierarchy-aware 3-phase pipeline.
 
 ## Architecture
 
+The This project uses a **DesignCoder-inspired 3-phase pipeline** that extracts hierarchy information before generating code — unlike single-pass screenshot-to-code tools, it it3-phase approach produces structurally correct HTML, not "flat div soup."
+
 ```
 ui-loop-test/
-├── static/components/{comp_id}/
-│   ├── preview.html        # Live preview (HTML)
-│   ├── reference.png       # Reference image
-│   ├── meta.json           # Iterations, SSIM, notes
-│   ├── screenshots/{n}.png # Screenshots per iteration
-│   └── diffs/{n}.png       # Diff overlays per iteration
-└── ui-inspo/               # Reference images to clone
+├── main.py                    # CLI entry point
+├── loop.py                    # Pipeline orchestration
+├── config.py                  # Provider & pipeline settings
+├── llm_client.py              # OpenAI-compatible HTTP client
+├── phases/
+│   ├── phase1_grouping/
+│   │   ├── division.py        # 1.1 UI Division
+│   │   ├── semantic.py       # 1.2 Semantic Extraction
+│   │   └── grouping.py        # 1.3 Component Grouping
+│   ├── phase2_codegen/
+│   │   ├── html_gen.py        # 2.1 HTML Generation
+│   │   └── style_gen.py       # 2.2 Style Generation (plain CSS)
+│   └── phase3_refinement/
+│       ├── matcher.py          # 3.2 Component Matching
+│       ├── comparator.py       # 3.3 Visual Comparison (per-component SSIM)
+│       └── repair.py            # 3.4 Targeted Repair (BeautifulSoup)
+├── utils/
+│   ├── image.py               # SSIM, color extraction, diff overlay
+│   ├── dom.py                 # Playwright DOM extraction
+│   └── metrics.py             # TreeBLEU, ContainerMatch, TreeEditDist
+├── storage/
+│   └── component.py           # Component state persistence (JSON)
+├── src/                       # SvelteKit viewer app
+│   ├── routes/
+│   │   ├── +page.svelte            # Component list
+│   │   ├── component/[id]/        # Component detail + preview
+│   │   └── api/components/     # REST API for component data
+│   └── lib/
+├── output/                   # Generated component files
+└── ui-inspo/                  # Reference images to clone
 ```
 
-## CLI Commands
-
-All tools run via:
-```bash
-uv run --with-requirements agent/requirements.txt python -m agent.tools <cmd> [args...]
-```
-
-### `create <name> [reference]`
-
-Create a new component directory.
-
-```bash
-python -m agent.tools create Card ui-inspo/card.png
-# Returns: {"id": "comp_xxx", "path": "...", "reference": "reference.png"}
-```
-
-### `get <comp_id>`
-
-Get component metadata and state.
-
-```bash
-python -m agent.tools get comp_xxx
-# Returns: {name, status, iterations, colors, scratchpad, ...}
-```
-
-### `write <comp_id>`
-
-Write HTML to the component (reads from stdin).
+## CLI Usage
 
 ```bash
-cat << 'EOF' | python -m agent.tools write comp_xxx
-<!DOCTYPE html>
-<html>
-<head><style>...</style></head>
-<body>...</body>
-</html>
-EOF
+# Install dependencies
+pip install -r requirements.txt
+
+# Set API keys
+export OPENROUTER_API_KEY=your_key
+export FIREWORKS_API_KEY=your_key
+
+# Run the full 3-phase pipeline
+python main.py ui-inspo/sample.png --name my-component
+
+# Run specific phases
+python main.py ui-inspo/sample.png --phase 1  # Just analyze structure
+python main.py ui-inspo/sample.png --phase 2  # Just generate code
+python main.py ui-inspo/sample.png --phase 3  # Just refine
+
+# Use different providers
+python main.py ui-inspo/sample.png --provider fireworks
+python main.py ui-inspo/sample.png --provider openrouter --vision-provider fireworks
 ```
 
-### `render <url>`
+## How It Works
 
-Render URL in headless browser, get screenshot.
+### Phase 1: UI Grouping Chain
 
-```bash
-python -m agent.tools render http://localhost:8080/preview.html
-# Returns: {"screenshot": "<base64>", "viewport": {...}, "console_errors": [...]}
-```
+1. **UI Division** — Partition screenshot into 3-10 semantic regions (nav, hero, footer, etc.)
+2. **Semantic Extraction** — Label elements within each region (buttons, headings, images, etc.)
+3. **Component Grouping** — Build a hierarchical component tree from flat elements
 
-### `diff <ref_path> <gen_b64>`
+### Phase 2: Hierarchy-Aware Code Generation
 
-Compare reference to generated screenshot.
+1. **HTML Generation** — Generate HTML structure that mirrors the component tree exactly
+2. **Style Generation** — Apply plain CSS styles based on bounding box geometry (no Tailwind)
 
-```bash
-python -m agent.tools diff /path/to/reference.png "$SCREENSHOT_B64"
-# Returns: {"ssim": 0.xx, "has_overlay": true}
-```
+### Phase 3: Self-Correcting Refinement
 
-### `colors <image_path>`
+1. **Render & Extract** — Render HTML in Playwright, capture screenshot + DOM
+2. **Component Matching** — Match rendered DOM elements to expected tree nodes
+3. **Visual Comparison** — Per-component SSIM + optional vision-model analysis
+4. **Targeted Repair** — Fix specific components via BeautifulSoup (no full-page rewrite)
+5. **Iterate** until SSIM threshold or max iterations reached
 
-Extract dominant colors.
+## Rules
 
-```bash
-python -m agent.tools colors ui-inspo/card.png
-# Returns: {"colors": [{"hex": "#xxx", "coverage_pct": xx}, ...]}
-```
-
-### `save <comp_id>`
-
-Save iteration data (reads JSON from stdin).
-
-```bash
-echo '{"screenshot": "...", "diff": "...", "ssim": 0.75}' | \
-  python -m agent.tools save comp_xxx
-```
-
-### `vision <prompt> <images...>`
-
-Analyze images with Gemini Pro.
-
-```bash
-python -m agent.tools vision "What's wrong with this UI?" ref.png current.png
-```
-
-### `scratchpad <comp_id> <action> [content]`
-
-Update component scratchpad (append/write/clear).
-
-```bash
-python -m agent.tools scratchpad comp_xxx append "Header looks good, focus on cards"
-```
-
----
-
-## Workflow
-
-### 1. Create Component
-
-```bash
-cd ~/Documents/ui-loop-test
-COMP_ID=$(uv run --with-requirements agent/requirements.txt python -m agent.tools create MyComponent ui-inspo/4-boxes-skeuomorphic.jpg | jq -r .id)
-echo "Component ID: $COMP_ID"
-```
-
-### 2. Start File Server
-
-```bash
-uv run --with-requirements agent/requirements.txt python -m http.server 8080 --directory static/components/$COMP_ID --bind 127.0.0.1 &
-SERVER_PID=$!
-```
-
-### 3. Iterate
-
-```bash
-# Write HTML
-cat << 'HTML' | uv run --with-requirements agent/requirements.txt python -m agent.tools write $COMP_ID
-<!DOCTYPE html>
-<html>
-<head>
-<style>
-  body { margin: 0; background: #e9e9e9; font-family: system-ui; }
-  /* Your styles here */
-</style>
-</head>
-<body>
-  <!-- Your HTML here -->
-</body>
-</html>
-HTML
-
-# Render and capture
-RESULT=$(uv run --with-requirements agent/requirements.txt python -m agent.tools render http://127.0.0.1:8080/preview.html)
-SCREENSHOT=$(echo $RESULT | jq -r .screenshot)
-
-# Compare to reference
-REF_PATH="static/components/$COMP_ID/reference.png"
-DIFF=$(uv run --with-requirements agent/requirements.txt python -m agent.tools diff $REF_PATH $SCREENSHOT)
-SSIM=$(echo $DIFF | jq -r .ssim)
-echo "SSIM: $SSIM"
-
-# Save iteration
-echo "{\"screenshot\": \"$SCREENSHOT\", \"ssim\": $SSIM}" | \
-  uv run --with-requirements agent/requirements.txt python -m agent.tools save $COMP_ID
-```
-
-### 4. View in Browser
-
-Open http://localhost:5173/component/$COMP_ID to see:
-- Live preview
-- Reference image
-- Iteration history with screenshots and diffs
-
-### 5. Get Gemini Feedback (when stuck)
-
-```bash
-uv run --with-requirements agent/requirements.txt python -m agent.tools vision \
-  "SSIM is $SSIM. What CSS is wrong?" \
-  $REF_PATH \
-  "data:image/png;base64,$SCREENSHOT"
-```
-
-### 6. Cleanup
-
-```bash
-kill $SERVER_PID
-```
-
----
+- **Plain CSS only** — no Tailwind, no utility classes, Use CSS custom properties and plain selectors.
+- Use colors from `extract_colors` for the palette.
+- The component tree from Phase 1 is the structural contract for Phase 2.
+- Phase 3 uses per-component SSIM, not just global SSIM.
+- Check the web UI (SvelteKit viewer) to see iteration history.
+- User decides when done.
 
 ## View Progress
 
-The SvelteKit app shows live progress:
+The SvelteKit viewer shows live progress:
 
-1. **Home page**: `/` - List all components with status
-2. **Component page**: `/component/[id]` - Preview + iterations
-3. **Preview**: `/component/[id]/preview` - Full page render
+1. **Home page**: `/` — List all components with status
+2. **Component page**: `/component/[id]` — Preview, iterations, diffs, activity feed
+3. **Test page**: `/test` — Phase 1 segmentation testing
 
 Start the dev server:
 ```bash
 npm run dev
 ```
 
----
+## Configuration
 
-## Rules
+Create a `.env` file:
 
-- Plain CSS in HTML (no frameworks)
-- Use colors from `colors` command
-- Check the web UI to see iteration history
-- Ask user after meaningful progress or 2-3 Gemini checkins
-- User decides when done
+```bash
+OPENROUTER_API_KEY=sk-or-v1-...
+FIREWORKS_API_KEY=fw-...
+DEFAULT_PROVIDER=openrouter
+```

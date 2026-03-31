@@ -1,0 +1,16 @@
+{
+  "id": "segtest_1774903338713_d385c761",
+  "name": "segtest_1774903338713",
+  "created_at": "2026-03-30T16:42:19.520277",
+  "reference_path": "/home/byndamzd/Documents/ui-loop-test/static/segtest_1774903338713_d385c761/reference.png",
+  "output_dir": "/home/byndamzd/Documents/ui-loop-test/static/segtest_1774903338713_d385c761",
+  "detected_elements": [],
+  "regions": [],
+  "tree": null,
+  "html_path": null,
+  "iterations": [],
+  "final_ssim": null,
+  "final_treebleu": null,
+  "final_container_match": null,
+  "scratchpad": ""
+}

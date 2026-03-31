@@ -1,0 +1,24 @@
+# UI Loop Test - Python Dependencies
+
+# HTTP / API
+aiohttp>=3.9.0
+
+# Browser automation
+playwright>=1.40.0
+
+# Image processing
+pillow>=10.0.0
+scikit-image>=0.22.0
+
+# Machine learning (color extraction, etc.)
+scikit-learn>=1.3.0
+numpy>=1.24.0
+
+# Tree algorithms (tree edit distance)
+zss>=1.2.0
+
+# HTML parsing (robust component extraction for Phase 3 repair)
+beautifulsoup4>=4.12.0
+
+# Environment management
+python-dotenv>=1.0.0
