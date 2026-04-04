@@ -39,7 +39,7 @@ class Config:
 
     # Providers
     provider: str = "openrouter"
-    vision_provider: Optional[str] = None
+    vision_provider: Optional[str] = "openrouter"
 
     # Paths
     output_dir: Path = field(default_factory=lambda: Path("./output"))
@@ -62,7 +62,7 @@ class Config:
     per_component_threshold: float = 0.90  # SSIM threshold for per-component match
 
     # Server settings
-    serve_port: int = 8080
+    serve_port: int = 8765
     serve_host: str = "127.0.0.1"
 
     def __post_init__(self):

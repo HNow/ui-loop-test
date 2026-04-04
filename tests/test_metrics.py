@@ -188,14 +188,14 @@ class TestConversions:
             ],
         )
         tree = dom_to_tree_node(dom)
-        assert tree.label == "div.card"
+        assert tree.label == "container"  # div → container via _TAG_TO_TYPE
         assert len(tree.children) == 1
-        assert tree.children[0].label == "p.text"
+        assert tree.children[0].label == "text"  # p → text via _TAG_TO_TYPE
 
     def test_dom_to_tree_node_no_classes(self):
         dom = DOMNode(tag="main")
         tree = dom_to_tree_node(dom)
-        assert tree.label == "main"
+        assert tree.label == "page"  # main → page via _TAG_TO_TYPE
 
     def test_component_tree_to_tree_node(self):
         root = Element(
@@ -216,9 +216,9 @@ class TestConversions:
         tree = ComponentTree(root_id="root", elements={"root": root, "c1": child})
         node = component_tree_to_tree_node(tree)
 
-        assert node.label == "container.root"
+        assert node.label == "container"  # bare type, no ID suffix
         assert len(node.children) == 1
-        assert node.children[0].label == "button.c1"
+        assert node.children[0].label == "button"
 
     def test_component_tree_with_cycle(self):
         a = Element(
@@ -240,9 +240,9 @@ class TestConversions:
         tree = ComponentTree(root_id="a", elements={"a": a, "b": b})
         node = component_tree_to_tree_node(tree)
 
-        assert node.label == "container.a"
+        assert node.label == "container"
         assert len(node.children) == 1
-        assert node.children[0].label == "container.b"
+        assert node.children[0].label == "container"
         assert node.children[0].children[0].label == "cycle_ref"
 
 

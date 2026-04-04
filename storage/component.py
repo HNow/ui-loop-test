@@ -97,6 +97,9 @@ class Component:
     final_treebleu: Optional[float] = None
     final_container_match: Optional[float] = None
 
+    # Phase 1 quality metrics (bbox drift between Phase 1.0 and Phase 1.2)
+    bbox_drift_stats: Optional[Dict[str, float]] = None
+
     # Scratchpad
     scratchpad: str = ""
 

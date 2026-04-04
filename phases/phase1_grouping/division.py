@@ -115,6 +115,14 @@ class UIDivision:
         # 3. Parse response into bounding boxes
         raw_regions = self._parse_division_response(response.content)
 
+        # 3a. Rescale region bboxes from 0-1000 normalized if needed
+        raw_regions = self._rescale_regions_if_normalized(
+            raw_regions, width, height
+        )
+
+        # 3b. Normalize region names (deduplicate, canonicalize)
+        raw_regions = self._normalize_region_names(raw_regions)
+
         # 4. Apply division correction rules (now element-aware)
         corrected_regions = self._apply_division_correction(
             raw_regions, width, height, elements
@@ -123,17 +131,20 @@ class UIDivision:
         # 5. Create Region objects with element assignments
         regions = []
         for i, (name, bbox) in enumerate(corrected_regions):
-            # Find elements that belong to this region
             region_elements = self.element_detector.filter_elements_for_region(
                 elements, bbox
             )
             element_ids = [e.id for e in region_elements]
-
             region = Region(
                 id=f"region_{i}", name=name, bbox=bbox, element_ids=element_ids
             )
             regions.append(region)
-            print(f"  [1.1] Region {i}: {name} with {len(element_ids)} elements")
+
+        # 6. Tighten regions: reassign orphans, drop empties, fit to elements
+        regions = self._tighten_regions(regions, elements, width, height)
+
+        for i, region in enumerate(regions):
+            print(f"  [1.1] Region {i}: {region.name} with {len(region.element_ids)} elements")
 
         return regions
 
@@ -154,7 +165,7 @@ class UIDivision:
 
         return f"""Analyze this UI screenshot and group the detected elements into 3-10 semantic regions.
 
-DETECTED ELEMENTS (with bounding boxes):
+DETECTED ELEMENTS (with pixel bounding boxes):
 {elements_str}
 
 Your task: Group these elements into semantic regions. Each region should contain elements that functionally belong together.
@@ -177,23 +188,28 @@ CRITICAL RULES:
 4. DO NOT cut through elements - boundaries should respect element bboxes
 5. Group related elements together (e.g., all header items in "navigation")
 6. Use semantic names, not positional ("navigation" not "top-section")
+7. All bounding box coordinates must use 0-1000 normalized scale
 
 Gap handling:
 - Small gaps (< 30px) between regions are normal (dividers, spacing)
 - Large gaps (> 5% of page height) should be their own region or assigned to nearest
 - If you see a clear divider line, respect it as a boundary
 
+Coordinate system: Use 0-1000 NORMALIZED coordinates for all bboxes.
+  x=0 is left edge, x=1000 is right edge
+  y=0 is top edge, y=1000 is bottom edge
+
 Output format - JSON only, no markdown:
 {{
   "regions": [
     {{
       "name": "navigation",
-      "bbox": {{"x": 0, "y": 0, "width": 1280, "height": 64}},
+      "bbox": {{"x": 0, "y": 0, "width": 1000, "height": 50}},
       "element_indices": [0, 1, 2]
     }},
     {{
       "name": "hero-section",
-      "bbox": {{"x": 0, "y": 64, "width": 1280, "height": 400}},
+      "bbox": {{"x": 0, "y": 50, "width": 1000, "height": 300}},
       "element_indices": [3, 4, 5, 6]
     }}
   ]
@@ -250,6 +266,96 @@ Respond with valid JSON only."""
             regions.append((name, bbox))
 
         return regions
+
+    def _rescale_regions_if_normalized(
+        self,
+        regions: List[Tuple[str, Tuple[int, int, int, int]]],
+        img_width: int,
+        img_height: int,
+    ) -> List[Tuple[str, Tuple[int, int, int, int]]]:
+        """
+        Rescale region bboxes from 0-1000 normalized coordinates to
+        actual pixel coordinates if needed.
+
+        Same heuristic as ElementDetector: if all right/bottom edges
+        are ≤ 1010 and the image exceeds 1000px, assume 0-1000.
+        """
+        if not regions:
+            return regions
+
+        max_right = max(b[0] + b[2] for _, b in regions)
+        max_bottom = max(b[1] + b[3] for _, b in regions)
+        image_exceeds = img_width > 1000 or img_height > 1000
+
+        if max_right <= 1010 and max_bottom <= 1010 and image_exceeds:
+            sx = img_width / 1000.0
+            sy = img_height / 1000.0
+            return [
+                (name, (round(x * sx), round(y * sy), round(w * sx), round(h * sy)))
+                for name, (x, y, w, h) in regions
+            ]
+        return regions
+
+    # Canonical region names — map common LLM variations to stable names
+    _NAME_ALIASES = {
+        "nav": "navigation",
+        "navbar": "navigation",
+        "header": "navigation",
+        "top-bar": "navigation",
+        "menu": "navigation",
+        "hero": "hero-section",
+        "banner": "hero-section",
+        "main-content": "content-section",
+        "content": "content-section",
+        "body": "content-section",
+        "cards": "content-grid",
+        "card-grid": "content-grid",
+        "product-grid": "content-grid",
+        "products": "content-grid",
+        "items": "content-grid",
+        "sidebar": "sidebar",
+        "side-panel": "sidebar",
+        "filters": "filters-section",
+        "filter": "filters-section",
+        "form": "form-section",
+        "input-section": "form-section",
+        "media": "media-section",
+        "gallery": "media-section",
+        "images": "media-section",
+        "tabs": "tabs-section",
+        "tab-bar": "tabs-section",
+        "footer": "footer",
+        "bottom": "footer",
+    }
+
+    def _normalize_region_names(
+        self, regions: List[Tuple[str, Tuple[int, int, int, int]]]
+    ) -> List[Tuple[str, Tuple[int, int, int, int]]]:
+        """
+        Normalize and deduplicate region names.
+
+        1. Lowercase + strip whitespace
+        2. Map common LLM name variations to canonical names
+        3. Append -2, -3, ... suffix for any remaining duplicates
+        """
+        normalized = []
+        for name, bbox in regions:
+            clean = name.strip().lower().replace(" ", "-").replace("_", "-")
+            clean = self._NAME_ALIASES.get(clean, clean)
+            normalized.append((clean, bbox))
+
+        # Deduplicate: append suffix for repeated names
+        seen: dict[str, int] = {}
+        deduped = []
+        for name, bbox in normalized:
+            if name in seen:
+                seen[name] += 1
+                deduped.append((f"{name}-{seen[name]}", bbox))
+            else:
+                seen[name] = 1
+                deduped.append((name, bbox))
+
+        return deduped
 
     def _fix_json_issues(self, json_str: str) -> str:
         """Fix common JSON formatting issues from LLM responses."""
@@ -398,6 +504,8 @@ Respond with valid JSON only."""
 
         return merged
 
+    _MAX_GAP_FILL_PX = 20
+
     def _ensure_vertical_tiling(
         self,
         regions: List[Tuple[str, Tuple[int, int, int, int]]],
@@ -405,17 +513,16 @@ Respond with valid JSON only."""
         img_height: int,
     ) -> List[Tuple[str, Tuple[int, int, int, int]]]:
         """
-        Ensure regions tile the full page vertically.
+        Ensure regions tile the page vertically with small gaps filled.
 
-        Gaps are always absorbed into the nearest region (previous or next)
-        rather than creating empty gap regions that waste API calls downstream.
+        Only gaps <= _MAX_GAP_FILL_PX are absorbed into the nearest
+        region.  Larger gaps are left as-is — they represent genuine
+        whitespace and should not distort region bounds.
         """
         if not regions:
             return [("full-page", (0, 0, img_width, img_height))]
 
         sorted_regions = sorted(regions, key=lambda r: r[1][1])
-
-        gap_threshold = img_height * 0.1
 
         filled = []
         current_y = 0
@@ -426,30 +533,28 @@ Respond with valid JSON only."""
             if y > current_y:
                 gap_height = y - current_y
 
-                if filled and gap_height < gap_threshold:
+                if gap_height <= self._MAX_GAP_FILL_PX and filled:
                     prev_name, prev_bbox = filled[-1]
                     px, py, pw, ph = prev_bbox
                     filled[-1] = (prev_name, (px, py, pw, ph + gap_height))
-                elif filled:
-                    prev_name, prev_bbox = filled[-1]
-                    px, py, pw, ph = prev_bbox
-                    filled[-1] = (prev_name, (px, py, pw, y - py))
-                else:
-                    filled.append((name, (0, 0, img_width, y + h)))
-                    current_y = y + h
-                    continue
+                elif gap_height > self._MAX_GAP_FILL_PX:
+                    print(
+                        f"  ⚠ Large gap ({gap_height}px) at y={current_y}, leaving unfilled"
+                    )
 
             filled.append((name, bbox))
             current_y = max(current_y, y + h)
 
         if current_y < img_height:
             gap_height = img_height - current_y
-            if filled:
+            if filled and gap_height <= self._MAX_GAP_FILL_PX:
                 last_name, last_bbox = filled[-1]
                 lx, ly, lw, lh = last_bbox
                 filled[-1] = (last_name, (lx, ly, lw, lh + gap_height))
-            else:
-                filled.append(("full-page", (0, 0, img_width, img_height)))
+            elif gap_height > self._MAX_GAP_FILL_PX:
+                print(
+                    f"  ⚠ Large gap ({gap_height}px) at page bottom, leaving unfilled"
+                )
 
         return filled
 
@@ -535,6 +640,81 @@ Respond with valid JSON only."""
                 regions.pop(smallest_idx)
             else:
                 break
+
+        return regions
+
+    # Padding (px) added around element-derived region bboxes so that
+    # region crops include enough visual context for downstream models.
+    _REGION_PAD = 30
+
+    def _tighten_regions(
+        self,
+        regions: List[Region],
+        elements: List[DetectedElement],
+        img_width: int,
+        img_height: int,
+    ) -> List[Region]:
+        """
+        Post-process regions to fix common model issues:
+
+        1. Assign orphan elements (not in any region) to nearest region
+        2. Drop regions with 0 elements
+        3. Recompute each region's bbox as the tight union of its
+           element bboxes + padding, so crops hug actual content
+           instead of being arbitrary full-width strips
+        """
+        elem_by_id = {e.id: e for e in elements}
+
+        # 1. Find orphan elements and assign to nearest region
+        assigned = set()
+        for r in regions:
+            assigned.update(r.element_ids)
+
+        orphans = [e for e in elements if e.id not in assigned]
+        for elem in orphans:
+            ecx = elem.bbox[0] + elem.bbox[2] / 2
+            ecy = elem.bbox[1] + elem.bbox[3] / 2
+            best_region = None
+            best_dist = float("inf")
+            for r in regions:
+                rx, ry, rw, rh = r.bbox
+                rcx = rx + rw / 2
+                rcy = ry + rh / 2
+                dist = ((ecx - rcx) ** 2 + (ecy - rcy) ** 2) ** 0.5
+                if dist < best_dist:
+                    best_dist = dist
+                    best_region = r
+            if best_region is not None:
+                best_region.element_ids.append(elem.id)
+
+        # 2. Drop regions with 0 elements
+        regions = [r for r in regions if r.element_ids]
+
+        # 3. Tighten each region's bbox to its elements + padding
+        pad = self._REGION_PAD
+        for r in regions:
+            bboxes = [
+                elem_by_id[eid].bbox
+                for eid in r.element_ids
+                if eid in elem_by_id
+            ]
+            if not bboxes:
+                continue
+            min_x = min(b[0] for b in bboxes)
+            min_y = min(b[1] for b in bboxes)
+            max_x = max(b[0] + b[2] for b in bboxes)
+            max_y = max(b[1] + b[3] for b in bboxes)
+            # Add padding, clamped to image bounds
+            min_x = max(0, min_x - pad)
+            min_y = max(0, min_y - pad)
+            max_x = min(img_width, max_x + pad)
+            max_y = min(img_height, max_y + pad)
+            r.bbox = (min_x, min_y, max_x - min_x, max_y - min_y)
+
+        # Re-sort by y position and reassign IDs
+        regions.sort(key=lambda r: r.bbox[1])
+        for i, r in enumerate(regions):
+            r.id = f"region_{i}"
 
         return regions
 

@@ -95,9 +95,8 @@ class ComponentGrouping:
                 )
 
                 if len(tree.elements) < len(elements):
-                    raise ValueError(
-                        f"Parsed tree has {len(tree.elements)} nodes but "
-                        f"region has {len(elements)} elements"
+                    print(
+                        f"⚠ Tree has {len(tree.elements)} nodes, expected {len(elements)}"
                     )
 
             except Exception as e:
@@ -177,15 +176,15 @@ Output format - JSON only:
     "type": "container",
     "children": [
       {{
-        "id": "child-1",
+        "id": "0",
         "type": "card",
         "children": [
-          {{"id": "grandchild-1", "type": "image"}},
-          {{"id": "grandchild-2", "type": "heading"}}
+          {{"id": "2", "type": "image"}},
+          {{"id": "3", "type": "heading"}}
         ]
       }},
       {{
-        "id": "child-2",
+        "id": "1",
         "type": "button"
       }}
     ]
@@ -196,8 +195,10 @@ Guidelines:
 - Real UIs rarely exceed 5-6 nesting levels
 - If a chain of single-child containers is deeper than 3 levels, flatten it
 - Every leaf element must have a parent container
-- Use element indices [0], [1], etc. as IDs, or create descriptive IDs
+- Use ONLY the element index numbers (0, 1, 2, ...) as IDs — NOT "[0]" or "child-0"
+- The "root" node is a synthetic container that holds all top-level elements
 - SIBLINGS share the same parent, they are NOT nested inside each other
+- You MUST include EVERY element in the tree — do not omit any
 
 Respond with valid JSON only."""
 
@@ -231,16 +232,13 @@ Respond with valid JSON only."""
             except json.JSONDecodeError as e:
                 raise ValueError(f"Invalid JSON: {e}")
 
-        # Build lookup tables so we can match LLM node IDs to real elements
         element_by_index = {str(i): e for i, e in enumerate(elements)}
         element_by_id = {e.id: e for e in elements}
 
-        # The LLM might use "hierarchy" or "tree" as the top-level key
         hierarchy = data.get("hierarchy", data.get("tree", {}))
 
-        # Recursively parse the hierarchy into Element objects
         tree_elements: Dict[str, Element] = {}
-        visited_ids: Set[str] = set()  # cycle guard
+        visited_ids: Set[str] = set()
         root_elem = self._parse_node_recursive(
             hierarchy,
             None,
@@ -250,6 +248,13 @@ Respond with valid JSON only."""
             tree_elements,
             visited_ids,
         )
+
+        for elem in elements:
+            if elem.id not in tree_elements:
+                root_elem.children_ids.append(elem.id)
+                elem_copy = copy.deepcopy(elem)
+                elem_copy.parent_id = root_elem.id
+                tree_elements[elem_copy.id] = elem_copy
 
         return ComponentTree(root_id=root_elem.id, elements=tree_elements, regions=[])
 
@@ -270,14 +275,18 @@ Respond with valid JSON only."""
         creates synthetic container elements. Tracks visited IDs to
         prevent cycles from malformed LLM output.
         """
-        node_id = node_data.get("id", "")
+        raw_id = node_data.get("id", "")
+        node_id = raw_id.strip("[]()")
 
-        # Try to match this node to an existing element from Phase 1.2
         original_elem = None
         if node_id in element_by_index:
             original_elem = element_by_index[node_id]
+        elif raw_id in element_by_index:
+            original_elem = element_by_index[raw_id]
         elif node_id in element_by_id:
             original_elem = element_by_id[node_id]
+        elif raw_id in element_by_id:
+            original_elem = element_by_id[raw_id]
 
         if original_elem:
             elem = copy.deepcopy(original_elem)
@@ -564,19 +573,21 @@ Respond with valid JSON only."""
             if elem_id not in visited:
                 dfs(elem_id)
 
+    _ABSOLUTE_DRIFT_CAP = 200
+
     def _compute_container_bboxes(self, tree: ComponentTree):
         """
-        Bottom-up pass: compute each container's bbox as the union
-        of its children's bboxes.
+        Bottom-up pass: compute bboxes ONLY for synthetic/placeholder
+        nodes (those created during grouping, not detected in Phase 1.0).
 
-        Uses a visited set to prevent infinite recursion if any
-        residual cycles exist.
+        Real detected elements keep their accurate Phase 1.0 bboxes.
+        Synthetic nodes (ID contains 'synthetic') and placeholders
+        (bbox area < 100) get their bbox computed as the union of
+        children bboxes.
         """
         visited: Set[str] = set()
 
         def compute_bbox(elem_id: str) -> Optional[Tuple[int, int, int, int]]:
-            """Recursively compute bbox for a node from its children."""
-            # Cycle guard
             if elem_id in visited:
                 elem = tree.elements.get(elem_id)
                 return elem.bbox if elem else None
@@ -586,19 +597,22 @@ Respond with valid JSON only."""
             if not elem:
                 return None
 
-            # Leaf node — return its own bbox
             if not elem.children_ids:
                 return elem.bbox
 
-            # Gather child bboxes
+            # Recurse into children so their bboxes are resolved first
             child_bboxes = []
             for child_id in elem.children_ids:
                 cb = compute_bbox(child_id)
                 if cb:
                     child_bboxes.append(cb)
 
-            if child_bboxes:
-                # Union of all child bboxes
+            ex, ey, ew, eh = elem.bbox
+            is_synthetic = "synthetic" in elem_id
+            is_placeholder = (ew * eh) < 100
+
+            # Only overwrite bbox for synthetic/placeholder nodes
+            if (is_synthetic or is_placeholder) and child_bboxes:
                 min_x = min(b[0] for b in child_bboxes)
                 min_y = min(b[1] for b in child_bboxes)
                 max_x = max(b[0] + b[2] for b in child_bboxes)

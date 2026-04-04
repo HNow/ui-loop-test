@@ -125,24 +125,62 @@ def compute_tree_edit_distance(generated: TreeNode, reference: TreeNode) -> int:
         return int((1 - compute_container_match(generated, reference)) * 100)
 
 
+# Reverse mapping: HTML tag → semantic type.
+# Both dom_to_tree_node and component_tree_to_tree_node must produce
+# labels from the SAME vocabulary or TreeBLEU/ContainerMatch will
+# always be 0.0.
+_TAG_TO_TYPE = {
+    "div": "container",
+    "main": "page",
+    "article": "card",
+    "section": "section",
+    "nav": "navigation",
+    "p": "text",
+    "h1": "heading",
+    "h2": "heading",
+    "h3": "heading",
+    "h4": "heading",
+    "h5": "heading",
+    "h6": "heading",
+    "button": "button",
+    "img": "image",
+    "span": "icon",
+    "input": "input",
+    "a": "link",
+    "hr": "divider",
+    "ul": "list",
+    "ol": "list",
+    "li": "list-item",
+    "select": "dropdown",
+    "textarea": "textarea",
+    "label": "label",
+    "dialog": "modal",
+    "header": "navigation",
+    "footer": "footer",
+    "figure": "image",
+    "figcaption": "text",
+    "table": "container",
+    "form": "container",
+    "body": "page",
+}
+
+
 def dom_to_tree_node(dom_node) -> TreeNode:
     """
     Convert DOMNode (from utils/dom.py) to TreeNode for metrics.
     Also handles ComponentTree (from storage/component.py) by dispatching
     to component_tree_to_tree_node().
+
+    Labels are mapped to semantic types via _TAG_TO_TYPE so that the
+    vocabulary matches component_tree_to_tree_node.
     """
     from storage.component import ComponentTree
 
     if isinstance(dom_node, ComponentTree):
         return component_tree_to_tree_node(dom_node)
 
-    classes_str = (
-        ".".join(dom_node.classes)
-        if hasattr(dom_node, "classes") and dom_node.classes
-        else ""
-    )
     tag = getattr(dom_node, "tag", "div")
-    label = f"{tag}.{classes_str}" if classes_str else tag
+    label = _TAG_TO_TYPE.get(tag, tag)
 
     children = [
         dom_to_tree_node(c)
@@ -154,6 +192,8 @@ def dom_to_tree_node(dom_node) -> TreeNode:
 def component_tree_to_tree_node(component_tree) -> TreeNode:
     """
     Convert ComponentTree (from storage/component.py) to TreeNode.
+    Labels use the bare semantic type (e.g. "container", "heading")
+    so they share a vocabulary with dom_to_tree_node.
     Uses a visited set to guard against cycles in the tree.
     """
     elements = component_tree.elements
@@ -169,7 +209,7 @@ def component_tree_to_tree_node(component_tree) -> TreeNode:
         if not element:
             return TreeNode(label="unknown")
 
-        label = f"{element.type}.{element.id}"
+        label = element.type
         children = [build_node(cid) for cid in element.children_ids]
         return TreeNode(label=label, children=children)
 

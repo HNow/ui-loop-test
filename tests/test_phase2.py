@@ -254,23 +254,35 @@ class TestStyleGeneratorCss:
         }
 
         css = gen._generate_custom_css(tree, layout, [])
-        assert ".container" in css
+        assert '[data-elem-id="p"]' in css
         assert "display: flex" in css
         assert "flex-direction: column" in css
 
-    def test_deduplicates_class_names(self):
+    def test_flex_containers_get_selectors(self):
         gen = StyleGenerator(make_client(), make_config())
-        e1 = make_element("e1", "button", (10, 10, 80, 30), "")
-        e2 = make_element("e2", "button", (100, 10, 80, 30), "")
+        parent = make_element(
+            "p", "container", (0, 0, 200, 200), "", children_ids=["e1", "e2"]
+        )
+        e1 = make_element("e1", "button", (10, 10, 80, 30), "", parent_id="p")
+        e2 = make_element("e2", "button", (100, 10, 80, 30), "", parent_id="p")
 
-        tree = ComponentTree(root_id="e1", elements={"e1": e1, "e2": e2})
+        tree = ComponentTree(
+            root_id="p", elements={"p": parent, "e1": e1, "e2": e2}
+        )
         layout = {
+            "p": {"display": "flex", "flex_direction": "row", "gap": 10,
+                  "padding": 0, "width": 200, "height": 200},
             "e1": {"display": "block", "width": 80, "height": 30},
             "e2": {"display": "block", "width": 80, "height": 30},
         }
 
         css = gen._generate_custom_css(tree, layout, [])
-        assert css.count(".button") == 1
+        # Container with flex gets a rule
+        assert '[data-elem-id="p"]' in css
+        assert "display: flex" in css
+        # Leaf elements with no flex/gap/padding get no rule
+        assert '[data-elem-id="e1"]' not in css
+        assert '[data-elem-id="e2"]' not in css
 
 
 class TestStyleGeneratorDocument:

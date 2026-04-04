@@ -74,12 +74,20 @@ class ElementDetector:
         return elements
     
     def _build_detection_prompt(self, width: int, height: int) -> str:
-        """Build prompt for element detection."""
+        """Build prompt for element detection.
+
+        Asks the model to return bounding boxes in 0-1000 normalized
+        coordinates (Gemini's native format) to avoid ambiguity about
+        whether returned values are pixels or normalized.
+        """
         return f"""Analyze this UI screenshot and detect ALL visible UI elements.
 
 For every interactive or visual element, provide:
 1. Element type (from the list below)
-2. Bounding box (x, y, width, height in pixels)
+2. Bounding box in NORMALIZED coordinates (0-1000 scale for both axes)
+   - x=0 is left edge, x=1000 is right edge
+   - y=0 is top edge, y=1000 is bottom edge
+   - width and height also on 0-1000 scale
 3. Visible text content (if any)
 
 Element types to detect:
@@ -108,10 +116,11 @@ Element types to detect:
 Rules:
 1. Detect EVERY visible element, even small ones
 2. Bounding boxes should tightly fit the element (no extra padding)
-3. For text elements, include the actual text content
-4. Nested elements: detect both parent container AND child elements
-5. If an element is partially visible, still detect it
-6. Confidence: estimate how clearly you can see this element (0.5-1.0)
+3. All coordinates must be on the 0-1000 normalized scale
+4. For text elements, include the actual text content
+5. Nested elements: detect both parent container AND child elements
+6. If an element is partially visible, still detect it
+7. Confidence: estimate how clearly you can see this element (0.5-1.0)
 
 Output format - JSON only:
 {{
@@ -124,23 +133,17 @@ Output format - JSON only:
       "confidence": 0.95
     }},
     {{
-      "id": "elem_1", 
+      "id": "elem_1",
       "type": "heading",
       "bbox": {{"x": 100, "y": 50, "width": 300, "height": 36}},
       "text": "Welcome to Our App",
       "confidence": 0.98
-    }},
-    {{
-      "id": "elem_2",
-      "type": "card",
-      "bbox": {{"x": 50, "y": 300, "width": 400, "height": 200}},
-      "text": "",
-      "confidence": 0.90
     }}
   ]
 }}
 
 Image dimensions: {width}x{height}
+All bbox values must use the 0-1000 normalized scale.
 
 Respond with valid JSON only. Include every element you can see."""
 
@@ -243,6 +246,43 @@ Respond with valid JSON only. Include every element you can see."""
         
         return normalized
     
+    def _rescale_from_normalized(
+        self,
+        elements: List[DetectedElement],
+        img_width: int,
+        img_height: int,
+    ) -> List[DetectedElement]:
+        """
+        Rescale bounding boxes from 0-1000 normalized coordinates
+        to actual pixel coordinates.
+
+        Gemini models return bboxes in a 0-1000 normalized coordinate
+        space regardless of actual image dimensions.  We detect this by
+        checking whether all right/bottom edges fall within [0, 1000].
+        """
+        if not elements:
+            return elements
+
+        # Heuristic: if every right-edge (x+w) and bottom-edge (y+h)
+        # is ≤ 1010 (small tolerance) AND the image exceeds 1000px in
+        # at least one dimension, assume 0-1000 normalized coords.
+        max_right = max(e.bbox[0] + e.bbox[2] for e in elements)
+        max_bottom = max(e.bbox[1] + e.bbox[3] for e in elements)
+        image_exceeds = img_width > 1000 or img_height > 1000
+
+        if max_right <= 1010 and max_bottom <= 1010 and image_exceeds:
+            sx = img_width / 1000.0
+            sy = img_height / 1000.0
+            for elem in elements:
+                x, y, w, h = elem.bbox
+                elem.bbox = (
+                    round(x * sx),
+                    round(y * sy),
+                    round(w * sx),
+                    round(h * sy),
+                )
+        return elements
+
     def _validate_elements(
         self,
         elements: List[DetectedElement],
@@ -250,39 +290,42 @@ Respond with valid JSON only. Include every element you can see."""
         img_height: int
     ) -> List[DetectedElement]:
         """Validate and clean detected elements."""
+        # Rescale from 0-1000 normalized coords to pixels
+        elements = self._rescale_from_normalized(elements, img_width, img_height)
+
         valid = []
-        
+
         for elem in elements:
             x, y, w, h = elem.bbox
-            
+
             # Skip zero-size
             if w <= 0 or h <= 0:
                 continue
-            
+
             # Skip if completely outside image
             if x >= img_width or y >= img_height:
                 continue
-            
+
             # Clamp to image bounds
             x = max(0, x)
             y = max(0, y)
             w = min(w, img_width - x)
             h = min(h, img_height - y)
-            
+
             # Skip very small elements (likely noise)
             if w < 5 or h < 5:
                 continue
-            
+
             elem.bbox = (x, y, w, h)
             valid.append(elem)
-        
+
         # Sort by position (top-to-bottom, left-to-right)
         valid.sort(key=lambda e: (e.bbox[1], e.bbox[0]))
-        
+
         # Reassign sequential IDs
         for i, elem in enumerate(valid):
             elem.id = f"elem_{i}"
-        
+
         return valid
     
     def filter_elements_for_region(

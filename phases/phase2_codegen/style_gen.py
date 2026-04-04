@@ -35,7 +35,7 @@ class StyleGenerator:
         self,
         component: Component,
         html_fragments: List[Dict[str, str]],
-        colors: List[dict]
+        colors: List[dict],
     ) -> str:
         """
         Apply plain CSS styles to HTML fragments.
@@ -52,16 +52,43 @@ class StyleGenerator:
 
         print("  Computing layout styles from bounding boxes...")
 
+        # Get reference image dimensions for page-level positioning
+        from PIL import Image as _PILImage
+
+        ref_width, ref_height = 0, 0
+        if component.reference_path:
+            try:
+                ref_img = _PILImage.open(component.reference_path)
+                ref_width, ref_height = ref_img.size
+            except Exception:
+                pass
+
         # Compute layout styles for every element in the tree
         layout_styles = {}
         for elem_id in component.tree.elements:
-            layout_styles[elem_id] = self._compute_layout_styles(elem_id, component.tree)
+            layout_styles[elem_id] = self._compute_layout_styles(
+                elem_id, component.tree
+            )
 
         # Turn layout data into a CSS block
-        custom_css = self._generate_custom_css(component.tree, layout_styles, colors)
+        custom_css = self._generate_custom_css(
+            component.tree, layout_styles, colors, ref_width, ref_height
+        )
 
         # Concatenate all HTML fragments into one body
-        body_html = "\n".join(f["html_fragment"] for f in html_fragments)
+        inner_html = "\n".join(f["html_fragment"] for f in html_fragments)
+
+        # Wrap in a page_root container if the tree has a page root.
+        # HTMLGenerator only generates region root children, not page_root
+        # itself, so we need this wrapper for absolute positioning to work.
+        has_page_root = (
+            component.tree.root_id == "page_root"
+            and component.tree.elements.get("page_root") is not None
+        )
+        if has_page_root:
+            body_html = f'<div data-elem-id="page_root">\n{inner_html}\n</div>'
+        else:
+            body_html = inner_html
 
         # Wrap everything in a full HTML document
         full_html = self._assemble_document(body_html, custom_css, colors)
@@ -72,25 +99,32 @@ class StyleGenerator:
     # Layout computation from bounding boxes
     # ------------------------------------------------------------------
 
-    def _compute_layout_styles(
-        self,
-        element_id: str,
-        tree: ComponentTree
-    ) -> dict:
-        """
-        Derive layout properties from the element's bbox and its
-        children's bboxes.
-
-        Returns a dict with: width, height, display, flex_direction,
-        padding, gap.
-        """
+    def _compute_layout_styles(self, element_id: str, tree: ComponentTree) -> dict:
         elem = tree.elements.get(element_id)
         if not elem:
             return {}
 
         x, y, w, h = elem.bbox
 
+        # Page root is a synthetic wrapper — don't compute flex from its
+        # placeholder bbox (0,0,1,1).  Flag it for special CSS treatment.
+        if elem.type == "page":
+            return {
+                "id": element_id,
+                "type": elem.type,
+                "is_page_root": True,
+                "x": x, "y": y, "width": w, "height": h,
+                "display": "block",
+                "flex_direction": None,
+                "padding": 0,
+                "gap": 0,
+            }
+
         styles = {
+            "id": element_id,
+            "type": elem.type,
+            "x": x,
+            "y": y,
             "width": w,
             "height": h,
             "display": "block",
@@ -99,18 +133,15 @@ class StyleGenerator:
             "gap": 0,
         }
 
-        # Leaf nodes don't need layout computation
         if not elem.children_ids:
             return styles
 
-        # Resolve child elements
         children = [tree.elements.get(cid) for cid in elem.children_ids]
         children = [c for c in children if c]
 
         if not children:
             return styles
 
-        # Determine flex direction from child arrangement
         child_centers_x = []
         child_centers_y = []
         for child in children:
@@ -122,26 +153,21 @@ class StyleGenerator:
         y_variance = max(child_centers_y) - min(child_centers_y)
 
         if x_variance > y_variance * 2:
-            # Children spread horizontally → flex row
             styles["display"] = "flex"
             styles["flex_direction"] = "row"
         elif y_variance > x_variance * 2:
-            # Children stacked vertically → flex column
             styles["display"] = "flex"
             styles["flex_direction"] = "column"
         else:
-            # Ambiguous — default to column if more vertical, row otherwise
             styles["display"] = "flex"
             styles["flex_direction"] = "column" if y_variance > x_variance else "row"
 
-        # Padding: distance from container edge to first child
         first_child = children[0]
         fx, fy, fw, fh = first_child.bbox
         padding_left = max(0, fx - x)
         padding_top = max(0, fy - y)
         styles["padding"] = min(padding_left, padding_top)
 
-        # Gap: average distance between consecutive siblings
         if len(children) > 1:
             if styles["flex_direction"] == "row":
                 prev_right = children[0].bbox[0] + children[0].bbox[2]
@@ -172,40 +198,58 @@ class StyleGenerator:
         self,
         tree: ComponentTree,
         layout_styles: Dict[str, dict],
-        colors: List[dict]
+        colors: List[dict],
+        ref_width: int = 0,
+        ref_height: int = 0,
     ) -> str:
         """
-        Build a plain CSS block from computed layout styles.
+        Generate CSS from computed layout styles.
 
-        Each element type gets a class rule with flex, gap, and
-        size custom properties.
+        - Page root: positioned container matching reference dimensions
+        - Region roots (children of page root): absolutely positioned
+          at their Phase 1 bboxes
+        - All other containers: flex direction, gap, padding only
         """
         css_rules = []
 
-        # Track which class names we've already emitted to avoid duplicates
-        emitted_classes = set()
+        # Identify region root element IDs (children of page_root)
+        root_elem = tree.elements.get(tree.root_id)
+        region_root_ids = set()
+        if root_elem and root_elem.type == "page":
+            region_root_ids = set(root_elem.children_ids)
 
         for elem_id, styles in layout_styles.items():
             elem = tree.elements.get(elem_id)
             if not elem:
                 continue
 
-            class_name = elem.type.lower()
-
-            # Skip duplicate class selectors (first occurrence wins)
-            if class_name in emitted_classes:
-                continue
-            emitted_classes.add(class_name)
-
+            selector = f'[data-elem-id="{elem_id}"]'
             css_props = []
 
-            # Size custom properties for reference
-            if styles.get("width"):
-                css_props.append(f"  --computed-width: {styles['width']}px;")
-            if styles.get("height"):
-                css_props.append(f"  --computed-height: {styles['height']}px;")
+            # Page root — fixed-size positioned container
+            if styles.get("is_page_root") and ref_width > 0:
+                css_props.append("  position: relative;")
+                css_props.append(f"  width: {ref_width}px;")
+                css_props.append(f"  height: {ref_height}px;")
+                css_props.append("  overflow: hidden;")
+                rule = f"{selector} {{\n" + "\n".join(css_props) + "\n}"
+                css_rules.append(rule)
+                continue
 
-            # Flex layout
+            # Region roots — absolutely positioned at their bbox
+            if elem_id in region_root_ids:
+                x = styles.get("x", 0)
+                y = styles.get("y", 0)
+                w = styles.get("width", 0)
+                h = styles.get("height", 0)
+                css_props.append("  position: absolute;")
+                css_props.append(f"  left: {x}px;")
+                css_props.append(f"  top: {y}px;")
+                css_props.append(f"  width: {w}px;")
+                css_props.append(f"  height: {h}px;")
+                css_props.append("  overflow: hidden;")
+
+            # Flex layout for containers with children
             if styles.get("display") == "flex":
                 css_props.append("  display: flex;")
                 if styles.get("flex_direction"):
@@ -213,12 +257,11 @@ class StyleGenerator:
                 if styles.get("gap", 0) > 0:
                     css_props.append(f"  gap: {styles['gap']}px;")
 
-            # Padding
             if styles.get("padding", 0) > 0:
                 css_props.append(f"  padding: {styles['padding']}px;")
 
             if css_props:
-                rule = f".{class_name} {{\n" + "\n".join(css_props) + "\n}"
+                rule = f"{selector} {{\n" + "\n".join(css_props) + "\n}"
                 css_rules.append(rule)
 
         return "\n\n".join(css_rules)
@@ -228,18 +271,8 @@ class StyleGenerator:
     # ------------------------------------------------------------------
 
     def _assemble_document(
-        self,
-        body_html: str,
-        custom_css: str,
-        colors: List[dict]
+        self, body_html: str, custom_css: str, colors: List[dict]
     ) -> str:
-        """
-        Wrap HTML body + CSS into a complete, self-contained HTML document.
-
-        Uses plain CSS only — no Tailwind CDN or utility classes.
-        Color palette is injected as CSS custom properties on :root.
-        """
-        # Build CSS custom properties from extracted color palette
         color_vars = []
         for i, color in enumerate(colors[:6]):
             var_name = "--color-primary" if i == 0 else f"--color-{i}"
@@ -254,7 +287,6 @@ class StyleGenerator:
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Generated UI</title>
     <style>
-/* ---------- Reset & Base ---------- */
 *, *::before, *::after {{
   box-sizing: border-box;
   margin: 0;
@@ -266,7 +298,9 @@ body {{
                "Helvetica Neue", Arial, sans-serif;
   line-height: 1.5;
   color: #1a1a1a;
-  background: #ffffff;
+  background: var(--color-primary, #ffffff);
+  width: 100%;
+  min-height: 100vh;
 }}
 
 img {{
@@ -274,12 +308,11 @@ img {{
   display: block;
 }}
 
-/* ---------- Color Palette ---------- */
 :root {{
 {color_vars_block}
 }}
 
-/* ---------- Component Styles ---------- */
+/* ---------- Layout from bounding boxes ---------- */
 {custom_css}
     </style>
 </head>

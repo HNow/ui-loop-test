@@ -14,7 +14,7 @@ import asyncio
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
-from storage.component import Component, ComponentTree, Element, Region
+from storage.component import Component, ComponentTree, Element, Region, DetectedElement
 from phases.phase1_grouping.grouping import ComponentGrouping
 from phases.phase1_grouping.semantic import SemanticExtraction
 
@@ -410,3 +410,230 @@ class TestSemanticExtraction:
         assert semantic._normalize_type("navigation") == "nav-item"
         assert semantic._normalize_type("h1") == "heading"
         assert semantic._normalize_type("unknown") == "container"  # Default fallback
+
+
+# ---------------------------------------------------------------------------
+# Label-only path tests (BUG-008)
+# ---------------------------------------------------------------------------
+
+
+def _make_detected(elem_id, elem_type="button", bbox=(10, 20, 100, 40), text="Click"):
+    return DetectedElement(id=elem_id, type=elem_type, bbox=bbox, text=text)
+
+
+class TestLabelOnlyPath:
+    """Tests for Phase 1.2 label-only path (BUG-008 fix)."""
+
+    @pytest.fixture
+    def semantic(self):
+        client = make_client()
+        config = make_config()
+        return SemanticExtraction(client, config)
+
+    def test_parse_label_response_valid(self, semantic):
+        content = json.dumps(
+            {
+                "classifications": [
+                    {
+                        "index": 0,
+                        "type": "heading",
+                        "content": "Title",
+                        "interactable": False,
+                    },
+                    {
+                        "index": 1,
+                        "type": "button",
+                        "content": "Submit",
+                        "interactable": True,
+                    },
+                ]
+            }
+        )
+        result = semantic._parse_label_response(content)
+        assert len(result) == 2
+        assert result[0]["type"] == "heading"
+        assert result[1]["interactable"] is True
+
+    def test_parse_label_response_no_json(self, semantic):
+        result = semantic._parse_label_response("No JSON here at all")
+        assert result == {}
+
+    def test_parse_label_response_trailing_commas(self, semantic):
+        content = (
+            '{"classifications": [{"index": 0, "type": "text", "content": "Hi",},]}'
+        )
+        result = semantic._parse_label_response(content)
+        assert len(result) == 1
+        assert result[0]["type"] == "text"
+
+    def test_parse_label_response_missing_index_ignored(self, semantic):
+        content = json.dumps(
+            {
+                "classifications": [
+                    {"type": "text", "content": "No index"},
+                    {"index": 2, "type": "button", "content": "Has index"},
+                ]
+            }
+        )
+        result = semantic._parse_label_response(content)
+        assert len(result) == 1
+        assert 2 in result
+
+    def test_build_label_only_prompt(self, semantic):
+        dets = [
+            _make_detected("d1", "button", (10, 20, 100, 40), "Book Now"),
+            _make_detected("d2", "text", (10, 70, 200, 20), "Total: $99"),
+        ]
+        prompt = semantic._build_label_only_prompt("Header", dets)
+        assert "Header" in prompt
+        assert "[0]" in prompt
+        assert "[1]" in prompt
+        assert "Book Now" in prompt
+        assert "Total: $99" in prompt
+        assert "classifications" in prompt
+
+    @pytest.mark.asyncio
+    async def test_label_existing_elements_uses_phase1_bboxes(self, semantic):
+        dets = [
+            _make_detected("d1", "button", (10, 20, 100, 40), "Book Now"),
+            _make_detected("d2", "text", (10, 70, 200, 20), "Total"),
+        ]
+        region = Region(id="r1", name="header", bbox=(0, 0, 500, 300))
+        region.crop_path = None
+
+        mock_resp = MagicMock()
+        mock_resp.content = json.dumps(
+            {
+                "classifications": [
+                    {
+                        "index": 0,
+                        "type": "button",
+                        "content": "Book Now",
+                        "interactable": True,
+                    },
+                    {
+                        "index": 1,
+                        "type": "text",
+                        "content": "Total: $99",
+                        "interactable": False,
+                    },
+                ]
+            }
+        )
+        semantic.client.vision_analyze = AsyncMock(return_value=mock_resp)
+
+        elements = await semantic._label_existing_elements(region, dets, False)
+
+        assert len(elements) == 2
+        assert elements[0].bbox == (10, 20, 100, 40)
+        assert elements[1].bbox == (10, 70, 200, 20)
+        assert elements[0].type == "button"
+        assert elements[1].type == "text"
+        assert elements[0].content_description == "Book Now"
+        assert elements[0].interactable is True
+
+    @pytest.mark.asyncio
+    async def test_label_existing_elements_fallback_on_bad_response(self, semantic):
+        dets = [_make_detected("d1", "button", (10, 20, 100, 40), "Click")]
+        region = Region(id="r1", name="header", bbox=(0, 0, 500, 300))
+
+        mock_resp = MagicMock()
+        mock_resp.content = "NO JSON HERE"
+        semantic.client.vision_analyze = AsyncMock(return_value=mock_resp)
+
+        elements = await semantic._label_existing_elements(region, dets, False)
+
+        assert len(elements) == 1
+        assert elements[0].bbox == (10, 20, 100, 40)
+        assert elements[0].type == "button"
+        assert elements[0].content_description == "Click"
+
+    @pytest.mark.asyncio
+    async def test_extract_label_only_path(self, semantic):
+        region = Region(id="r1", name="header", bbox=(0, 0, 500, 300))
+        region.crop_path = None
+
+        dets = [_make_detected("d1", "button", (10, 20, 100, 40), "Go")]
+        region_detections = {"r1": dets}
+
+        mock_resp = MagicMock()
+        mock_resp.content = json.dumps(
+            {
+                "classifications": [
+                    {
+                        "index": 0,
+                        "type": "button",
+                        "content": "Go",
+                        "interactable": True,
+                    },
+                ]
+            }
+        )
+        semantic.client.vision_analyze = AsyncMock(return_value=mock_resp)
+
+        component = MagicMock()
+        elements_by_region, stats = await semantic.extract(
+            component,
+            [region],
+            region_detections=region_detections,
+        )
+
+        assert "r1" in elements_by_region
+        assert len(elements_by_region["r1"]) == 1
+        assert stats["regions_label_only"] == 1
+        assert stats["regions_redetect"] == 0
+        assert stats["method"] == "label-only"
+
+    @pytest.mark.asyncio
+    async def test_extract_skips_region_with_no_detections_and_no_crop(self, semantic):
+        region = Region(id="r1", name="body", bbox=(0, 0, 500, 500))
+        region.crop_path = None
+
+        component = MagicMock()
+        elements_by_region, stats = await semantic.extract(
+            component,
+            [region],
+            region_detections={},
+        )
+
+        assert elements_by_region["r1"] == []
+        assert stats["regions_redetect"] == 0
+        assert stats["total_elements"] == 0
+
+    @pytest.mark.asyncio
+    async def test_extract_mixed_modes(self, semantic, tmp_path):
+        r1 = Region(id="r1", name="header", bbox=(0, 0, 500, 200))
+        r1.crop_path = None
+        r2 = Region(id="r2", name="footer", bbox=(0, 800, 500, 200))
+        crop = tmp_path / "r2_crop.png"
+        crop.write_bytes(b"fake")
+        r2.crop_path = crop
+
+        dets = [_make_detected("d1", "text", (10, 10, 50, 20), "Hi")]
+        region_detections = {"r1": dets}
+
+        mock_resp = MagicMock()
+        mock_resp.content = json.dumps(
+            {
+                "classifications": [
+                    {
+                        "index": 0,
+                        "type": "text",
+                        "content": "Hi",
+                        "interactable": False,
+                    },
+                ]
+            }
+        )
+        semantic.client.vision_analyze = AsyncMock(return_value=mock_resp)
+
+        component = MagicMock()
+        elements_by_region, stats = await semantic.extract(
+            component,
+            [r1, r2],
+            region_detections=region_detections,
+        )
+
+        assert stats["regions_label_only"] == 1
+        assert stats["regions_redetect"] == 1
+        assert stats["method"] == "mixed"
