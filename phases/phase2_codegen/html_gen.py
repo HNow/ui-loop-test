@@ -429,6 +429,120 @@ Output ONLY the HTML fragment (no <html>, <head>, <body>). Start with <style> th
             content = elem.content_description if not children_html else ""
             return f"<{tag} {' '.join(attrs)}>{content}{children_html}</{tag}>"
 
+    # ------------------------------------------------------------------
+    # VLLM single-shot full-page codegen
+    # ------------------------------------------------------------------
+
+    async def generate_vllm_fullpage(
+        self, component: Component, colors: List[dict]
+    ) -> str:
+        """
+        Generate full-page HTML from screenshot in a single VLLM call.
+
+        Returns raw HTML string (not wrapped in document structure yet —
+        that's handled by StyleGenerator.ensure_document_structure).
+        """
+        prompt = self._build_vllm_prompt(component, colors)
+
+        response = await self.client.codegen_from_vision(
+            prompt=prompt,
+            images=[component.reference_path],
+            temperature=0.2,
+        )
+
+        html = self._extract_html(response.content)
+
+        # Strip external URLs / hallucinated content
+        if html:
+            html = self._sanitize_vllm_output(html)
+
+        return html
+
+    def _build_vllm_prompt(
+        self, component: Component, colors: List[dict]
+    ) -> str:
+        """Build prompt for VLLM single-shot full-page HTML generation."""
+        ref_w, ref_h = 0, 0
+        if component.reference_path:
+            from PIL import Image as _PILImage
+            try:
+                img = _PILImage.open(component.reference_path)
+                ref_w, ref_h = img.size
+            except Exception:
+                pass
+
+        return f"""Clone the UI shown in this screenshot using HTML and CSS. Ignore the background/hero image — use a solid color placeholder instead.
+
+Page must render at exactly {ref_w}x{ref_h}px.
+
+Rules:
+1. Complete self-contained HTML page (DOCTYPE, head, body) with embedded <style>
+2. Plain CSS only — no Tailwind, no external frameworks, no external URLs
+3. Semantic HTML tags (nav, section, h1-h6, p, button, article, etc.)
+4. CSS reset: box-sizing border-box, margin 0, padding 0
+5. Match text content, font sizes, spacing, and visual hierarchy exactly
+6. For images, use a solid color div placeholder
+7. Icons — use simple Unicode characters or minimal inline SVG
+
+Output ONLY the HTML. No explanation."""
+
+    def _sanitize_vllm_output(self, html: str) -> str:
+        """Strip external URLs and hallucinated content from VLLM output."""
+        import re as _re
+        from bs4 import BeautifulSoup as _BS
+
+        soup = _BS(html, "html.parser")
+
+        _EXT_URL_RE = _re.compile(
+            r'url\(["\']?https?://[^)]+["\']?\)',
+            _re.IGNORECASE,
+        )
+        _SVG_PLACEHOLDER = (
+            'url("data:image/svg+xml,'
+            "%3Csvg xmlns='http://www.w3.org/2000/svg'/%3E\")"
+        )
+
+        # Replace external <img> src
+        for img in soup.find_all("img"):
+            src = img.get("src", "")
+            if src and not src.startswith("data:"):
+                placeholder = soup.new_tag("div")
+                for attr in ("class", "id", "style"):
+                    if img.get(attr):
+                        placeholder[attr] = img[attr]
+                existing_style = placeholder.get("style", "")
+                placeholder["style"] = (
+                    existing_style
+                    + "; background-color: #e5e7eb;"
+                    + " min-height: 100px; min-width: 100px;"
+                )
+                img.replace_with(placeholder)
+
+        # Strip external URLs from inline styles
+        for tag in soup.find_all(style=True):
+            tag["style"] = _EXT_URL_RE.sub(_SVG_PLACEHOLDER, tag["style"])
+
+        # Strip external URLs from <style> blocks
+        for style_tag in soup.find_all("style"):
+            if style_tag.string:
+                style_tag.string = _EXT_URL_RE.sub(
+                    _SVG_PLACEHOLDER, style_tag.string
+                )
+
+        # Neutralize external <a> hrefs
+        for a_tag in soup.find_all("a"):
+            href = a_tag.get("href", "")
+            if href.startswith("http"):
+                a_tag["href"] = "#"
+
+        # Remove <link> tags pointing to external stylesheets
+        for link in soup.find_all("link"):
+            href = link.get("href", "")
+            if href.startswith("http"):
+                link.decompose()
+
+        return str(soup)
+
     def _generate_svg_placeholder(self, width: int = 100, height: int = 100) -> str:
         """Generate SVG placeholder for images."""
         svg = f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}"><rect width="100%" height="100%" fill="#e5e7eb"/></svg>'

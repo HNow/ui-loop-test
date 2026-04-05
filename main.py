@@ -80,6 +80,12 @@ def main():
         help="Output directory for generated components",
     )
     parser.add_argument(
+        "--codegen-model",
+        type=str,
+        default=None,
+        help="VLLM model for single-shot codegen (e.g. qwen/qwen-2.5-vl-72b-instruct)",
+    )
+    parser.add_argument(
         "--phase",
         type=str,
         choices=["1", "2", "3", "all"],
@@ -101,6 +107,7 @@ def main():
         vision_provider=args.vision_provider or args.provider,
         max_iterations=args.max_iter,
         output_dir=Path(args.output_dir),
+        codegen_model=args.codegen_model,
     )
 
     store = ComponentStore(config.output_dir)
@@ -115,6 +122,7 @@ def main():
     logger.info(f"Component ID:   {component.id}")
     logger.info(f"Provider:       {config.provider}")
     logger.info(f"Vision:         {config.vision_provider}")
+    logger.info(f"Codegen Model:  {config.codegen_model or 'tree-based (default)'}")
     logger.info(f"Max Iterations: {config.max_iterations}")
     logger.info(f"Output:         {component.output_dir}")
     logger.info(f"Log file:       {component.output_dir / 'pipeline.log'}")

@@ -48,7 +48,8 @@ from phases.phase2_codegen.style_gen import StyleGenerator
 
 from phases.phase3_refinement.matcher import ComponentMatcher
 from phases.phase3_refinement.comparator import VisualComparator
-from phases.phase3_refinement.repair import TargetedRepair
+from phases.phase3_refinement.repair import FullPageRepair
+from phases.phase3_refinement.element_comparator import ElementCloseupComparator
 
 
 REGION_PALETTE = [
@@ -580,22 +581,38 @@ class AgentLoop:
         t0 = time.time()
         code_config = self.config.get_llm_config(for_vision=False)
         vision_config = self.config.get_llm_config(for_vision=True)
+        codegen_config = self.config.get_codegen_llm_config()
 
-        async with DualProviderClient(code_config, vision_config) as client:
+        async with DualProviderClient(code_config, vision_config, codegen_config) as client:
             self.log.info("[2.0] Extracting color palette...")
             colors = extract_colors(component.reference_path)
             self._save_phase2_colors(colors, component)
             for c in colors[:6]:
                 self.log.info(f"  {c['hex']} ({c['coverage_pct']:.1f}%)")
 
-            self.log.info("[2.1] Generating HTML structure...")
             html_gen = HTMLGenerator(client, self.config)
-            html_fragments = await html_gen.generate(component, colors)
-            self.log.info(f"  -> {len(html_fragments)} HTML fragments")
-
-            self.log.info("[2.2] Generating CSS styles...")
             style_gen = StyleGenerator(client, self.config)
-            full_html = await style_gen.apply_styles(component, html_fragments, colors)
+
+            if self.config.codegen_model:
+                # VLLM single-shot codegen path
+                self.log.info(
+                    f"[2.1] VLLM single-shot codegen ({self.config.codegen_model})..."
+                )
+                raw_html = await html_gen.generate_vllm_fullpage(component, colors)
+                self.log.info(f"  -> {len(raw_html)} chars raw HTML")
+
+                self.log.info("[2.2] Ensuring document structure...")
+                full_html = style_gen.ensure_document_structure(raw_html, colors)
+            else:
+                # Tree-based codegen path (default)
+                self.log.info("[2.1] Generating HTML structure (tree-based)...")
+                html_fragments = await html_gen.generate(component, colors)
+                self.log.info(f"  -> {len(html_fragments)} HTML fragments")
+
+                self.log.info("[2.2] Generating CSS styles...")
+                full_html = await style_gen.apply_styles(
+                    component, html_fragments, colors
+                )
 
             html_path = component.output_dir / "index.html"
             html_path.write_text(full_html, encoding="utf-8")
@@ -619,10 +636,11 @@ class AgentLoop:
             code_config = self.config.get_llm_config(for_vision=False)
             vision_config = self.config.get_llm_config(for_vision=True)
 
-            async with DualProviderClient(code_config, vision_config) as client:
-                matcher = ComponentMatcher(client, self.config)
-                comparator = VisualComparator(client, self.config)
-                repair = TargetedRepair(client, self.config)
+            codegen_config = self.config.get_codegen_llm_config()
+
+            async with DualProviderClient(code_config, vision_config, codegen_config) as client:
+                element_comparator = ElementCloseupComparator(client, self.config)
+                repair = FullPageRepair(client, self.config)
 
                 scores: List[float] = []
                 all_metrics: List[dict] = []
@@ -762,16 +780,24 @@ class AgentLoop:
                         else:
                             plateau_count = 0
 
-                    self.log.info("  Matching components...")
-                    matches = await matcher.match(dom_tree, component.tree)
-                    self.log.info(f"  {len(matches)} component matches")
-
-                    self.log.info("  Comparing visuals...")
-                    issues = await comparator.compare(
-                        matches,
-                        component,
-                        rendered_screenshot_path=screenshot_path,
+                    self.log.info("  Element closeup comparison...")
+                    issues, comparison_log = await element_comparator.compare(
+                        component, screenshot_path, iteration + 1
                     )
+                    n_below = sum(
+                        1 for e in comparison_log
+                        if e["ssim"] < self.config.per_component_threshold
+                    )
+                    self.log.info(
+                        f"  {len(comparison_log)} elements compared, "
+                        f"{n_below} below threshold"
+                    )
+                    for entry in comparison_log[:5]:
+                        self.log.info(
+                            f"    {entry['element_type']} "
+                            f"({entry['element_id']}): "
+                            f"SSIM={entry['ssim']:.3f}"
+                        )
 
                     if not issues:
                         self.log.info("  No issues found - done")
@@ -785,8 +811,10 @@ class AgentLoop:
                             f"{issue.get('description', '')[:80]}"
                         )
 
-                    self.log.info("  Repairing...")
-                    new_html = await repair.repair(component, issues, dom_tree)
+                    self.log.info("  Full-page repair...")
+                    new_html = await repair.repair(
+                        component, issues, comparison_log, screenshot_path,
+                    )
                     component.html_path.write_text(new_html, encoding="utf-8")
 
                     component.iterations.append(

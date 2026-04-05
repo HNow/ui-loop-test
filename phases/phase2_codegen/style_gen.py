@@ -270,6 +270,54 @@ class StyleGenerator:
     # Document assembly
     # ------------------------------------------------------------------
 
+    def ensure_document_structure(self, html: str, colors: List[dict]) -> str:
+        """
+        Ensure VLLM output has proper document structure.
+
+        If the HTML already has <!DOCTYPE> or <html>, return as-is
+        (after injecting CSS reset and color vars if missing).
+        Otherwise wrap in full document structure.
+        """
+        html_lower = html.lower().strip()
+
+        # Already a full document — inject reset CSS if missing
+        if html_lower.startswith("<!doctype") or html_lower.startswith("<html"):
+            if "box-sizing: border-box" not in html:
+                # Inject reset into existing <style> or add one
+                reset = self._css_reset(colors)
+                if "<style>" in html.lower():
+                    html = html.replace(
+                        "<style>", f"<style>\n{reset}\n", 1
+                    )
+                elif "</head>" in html.lower():
+                    html = html.replace(
+                        "</head>",
+                        f"<style>\n{reset}\n</style>\n</head>",
+                        1,
+                    )
+            return html
+
+        # Fragment — wrap in full document
+        return self._assemble_document(html, "", colors)
+
+    def _css_reset(self, colors: List[dict]) -> str:
+        """Generate CSS reset + color variables block."""
+        color_vars = []
+        for i, color in enumerate(colors[:6]):
+            var_name = "--color-primary" if i == 0 else f"--color-{i}"
+            color_vars.append(f"  {var_name}: {color['hex']};")
+        color_vars_block = "\n".join(color_vars) if color_vars else ""
+
+        return f"""*, *::before, *::after {{
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}}
+
+:root {{
+{color_vars_block}
+}}"""
+
     def _assemble_document(
         self, body_html: str, custom_css: str, colors: List[dict]
     ) -> str:

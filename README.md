@@ -1,282 +1,247 @@
 # UI Loop Test
 
-A standalone UI cloning agent that converts screenshots to HTML components using a DesignCoder-inspired 3-phase hierarchy-aware pipeline.
+A standalone UI cloning agent that converts screenshots into pixel-accurate HTML/CSS using a DesignCoder-inspired 3-phase pipeline. Feed it a screenshot, get back a self-contained HTML page that looks like the original.
 
 ## Quick Start
 
 ```bash
-# Install dependencies
-pip install -r requirements.txt
+# Install dependencies (using uv)
+uv sync
 
-# Set API keys
-export OPENROUTER_API_KEY=your_key
-export FIREWORKS_API_KEY=your_key
+# Install Playwright browsers (needed for rendering)
+uv run playwright install chromium
 
-# Run the pipeline
-python main.py ui-inspo/sample.png --name my-component
+# Set your API key
+cp .env.example .env
+# Edit .env and add your OPENROUTER_API_KEY
+
+# Run the full pipeline
+uv run python main.py ui-inspo/ui-booking-confirmation.jpg --name booking
+
+# Or use VLLM single-shot codegen for a higher fidelity baseline
+uv run python main.py ui-inspo/ui-booking-confirmation.jpg --name booking \
+  --codegen-model qwen/qwen-2.5-vl-72b-instruct
 ```
 
 ## How It Works
 
-The system follows the **DesignCoder** paper's three-phase approach:
+The pipeline has three phases. Each phase feeds into the next, and the whole thing runs as an async loop.
 
-### Phase 1: UI Grouping Chain
+### Phase 1: UI Grouping
 
-**1.1 UI Division** - Partition the screenshot into 3-10 semantic regions (navigation, hero, content grid, etc.)
+Analyzes the screenshot to understand its structure before generating any code.
 
-**1.2 Semantic Extraction** - Identify and label all elements within each region (buttons, headings, images, etc.)
+| Step | Module | What it does |
+|------|--------|-------------|
+| 1.0 | `element_detection.py` | Detect all UI elements (buttons, text, images, etc.) with bounding boxes |
+| 1.1 | `division.py` | Partition the page into 3-10 semantic regions (navigation, hero, content-grid, etc.) using element positions to inform boundaries |
+| 1.2 | `semantic.py` | Label each element with type, content, and interactability via a label-only path that preserves Phase 1.0 bounding boxes |
+| 1.3 | `grouping.py` | Build a hierarchical component tree where parent-child relationships reflect visual containment |
 
-**1.3 Component Grouping** - Build a hierarchical component tree where parent-child relationships reflect visual containment
+Key details:
+- Element detection runs *first* so region boundaries never split an element in half
+- Regions use 0-1000 normalized coordinates from the model, rescaled to actual pixels
+- Post-tightening overlap resolution handles cases where regions end up nested after bbox recomputation
+- All coordinates are saved to `artifacts/` as overlay images for debugging
 
-### Phase 2: Hierarchy-Aware Code Generation
+### Phase 2: Code Generation
 
-**2.1 HTML Generation** - Generate HTML structure that follows the component tree exactly
+Turns the component tree into HTML/CSS. Two modes:
 
-**2.2 Style Generation** - Apply plain CSS based on computed layout from bounding boxes (no Tailwind)
+**Tree-based (default):** Generates HTML per-region by walking the component tree. Each element gets a `data-elem-id` attribute and semantic HTML tag. Layout CSS (flex direction, gap, padding) is computed from bounding box geometry. Region roots are absolutely positioned within a page container.
+
+**VLLM single-shot (`--codegen-model`):** Sends the full screenshot to a strong vision-language model in one call to generate the complete page. The output is sanitized (external URLs stripped, images replaced with placeholders) and wrapped in proper document structure. This typically produces a higher-fidelity baseline.
+
+Both modes produce plain CSS only, no Tailwind.
 
 ### Phase 3: Self-Correcting Refinement
 
-**3.2 Component Matching** - Match rendered DOM elements back to expected tree nodes
+Iteratively improves the generated HTML by comparing it against the reference screenshot.
 
-**3.3 Visual Comparison** - Compare components and categorize issues (misarrangement, style error, missing element)
+Each iteration:
+1. Render the HTML via Playwright, screenshot it at reference dimensions
+2. Compute per-region SSIM between reference and rendered
+3. **Element closeup comparison**: for each Phase 1 element bbox, crop both reference and rendered at the same coordinates, compute per-element SSIM
+4. Send the worst-scoring element closeups to VLLM for qualitative diff analysis
+5. Targeted repair: fix specific components using the issue list + closeup crops as visual context
+6. If SSIM drops, revert to best and stop; if SSIM plateaus, stop; if SSIM exceeds threshold, converge
 
-**3.4 Targeted Repair** - Fix specific components without rewriting the entire page
+Artifacts saved each iteration:
+- `iter_N.png` — rendered screenshot
+- `iter_N_diff.png` — per-region diff overlay
+- `artifacts/iter_N_closeups/` — ref and gen crops for each element
+- `artifacts/iter_N_element_comparison.json` — full per-element SSIM log
 
-## Why This Approach?
+## Usage
 
-Traditional screenshot-to-code tools produce "flat div soup" - they describe what's visible but miss the hierarchy (which elements contain which). This matters because:
-
-- Two UIs can look pixel-identical with different DOM trees
-- Hierarchy affects responsiveness, accessibility, and maintainability
-- SSIM alone can't catch "button outside card" vs "button inside card" errors
-
-The DesignCoder paper showed that adding hierarchy extraction improves structural metrics by 25-30% and visual similarity by ~10%.
-
-## Usage Examples
-
-### Run Full Pipeline
 ```bash
-python main.py ui-inspo/sample.png --name login-page
-```
+# Full pipeline
+uv run python main.py ui-inspo/sample.png --name my-component
 
-### Run Specific Phase
-```bash
-# Just analyze structure
-python main.py ui-inspo/sample.png --phase 1
+# Specific phase
+uv run python main.py ui-inspo/sample.png --phase 1   # grouping only
+uv run python main.py ui-inspo/sample.png --phase 2   # codegen only
+uv run python main.py ui-inspo/sample.png --phase 3   # refinement only
 
-# Generate code from existing analysis
-python main.py ui-inspo/sample.png --phase 2
+# VLLM codegen (single-shot from screenshot)
+uv run python main.py ui-inspo/sample.png --codegen-model qwen/qwen-2.5-vl-72b-instruct
 
-# Refine existing code
-python main.py ui-inspo/sample.png --phase 3
-```
+# Provider selection
+uv run python main.py ui-inspo/sample.png --provider openrouter          # default
+uv run python main.py ui-inspo/sample.png --provider fireworks
+uv run python main.py ui-inspo/sample.png --vision-provider openrouter   # different model for vision
 
-### Provider Selection
-```bash
-# Use OpenRouter (default)
-python main.py ui-inspo/sample.png --provider openrouter
+# Tuning
+uv run python main.py ui-inspo/sample.png --max-iter 16 --output-dir ./my-output
 
-# Use Fireworks
-python main.py ui-inspo/sample.png --provider fireworks
-
-# Different providers for code vs vision
-python main.py ui-inspo/sample.png --provider fireworks --vision-provider openrouter
-```
-
-### Advanced Options
-```bash
-python main.py ui-inspo/sample.png \
-  --name my-component \
-  --max-iter 10 \
-  --output-dir ./my-output \
-  --provider fireworks
+# Run tests
+uv run python -m pytest tests/ -v --tb=short
 ```
 
 ## Output Structure
 
 ```
-output/
-└── {component_id}/
-    ├── reference.png          # Original reference image
-    ├── component.json         # Full component state (regions, tree, iterations)
-    ├── index.html            # Generated HTML output
-    ├── region_*.png          # Cropped region images
-    └── iter_*.png            # Screenshots from refinement iterations
+output/{component_id}/
+├── reference.png                          # Original screenshot
+├── component.json                         # Full state (regions, tree, iterations, metrics)
+├── pipeline.log                           # Detailed pipeline log
+├── index.html                             # Generated HTML
+├── region_*.png                           # Cropped region images from Phase 1
+├── iter_*.png                             # Rendered screenshots per iteration
+├── iter_*_diff.png                        # Per-region diff overlays
+└── artifacts/
+    ├── phase1_detection_overlay.png       # Element bboxes drawn on reference
+    ├── phase1_segmentation_overlay.png    # Region bboxes with element outlines
+    ├── phase1_drift_overlay.png           # Phase 1.0 vs 1.2 bbox drift
+    ├── phase1_tree.json                   # Component tree structure
+    ├── phase1_elements.json               # Per-region element data
+    ├── phase2_colors.json                 # Extracted color palette
+    ├── phase3_metrics.json                # SSIM/TreeBLEU/etc per iteration
+    ├── iter_N_closeups/                   # Per-element ref+gen crops
+    │   ├── elem_0_ref.png
+    │   ├── elem_0_gen.png
+    │   └── ...
+    └── iter_N_element_comparison.json     # Per-element SSIM log
 ```
 
-## Architecture
+## Project Structure
 
 ```
-┌─────────────────────────────────────────────────────────────┐
-│  STANDALONE UI CLONING AGENT                                 │
-├─────────────────────────────────────────────────────────────┤
-│                                                              │
-│  ┌─────────────────────────────────────────────────────┐   │
-│  │ PHASE 1: UI Grouping Chain                          │   │
-│  │ ├── UIDivision: Segment into semantic regions       │   │
-│  │ ├── SemanticExtraction: Label elements             │   │
-│  │ └── ComponentGrouping: Build hierarchy tree         │   │
-│  └─────────────────────────────────────────────────────┘   │
-│                           ↓                                 │
-│  ┌─────────────────────────────────────────────────────┐   │
-│  │ PHASE 2: Hierarchy-Aware Code Generation            │   │
-│  │ ├── HTMLGenerator: Generate from tree structure       │   │
-│  │ └── StyleGenerator: Apply plain CSS styles           │   │
-│  └─────────────────────────────────────────────────────┘   │
-│                           ↓                                 │
-│  ┌─────────────────────────────────────────────────────┐   │
-│  │ PHASE 3: Self-Correcting Refinement                 │   │
-│  │ ├── ComponentMatcher: Match DOM to tree              │   │
-│  │ ├── VisualComparator: Find issues                  │   │
-│  │ └── TargetedRepair: Fix specific components          │   │
-│  └─────────────────────────────────────────────────────┘   │
-│                                                              │
-├─────────────────────────────────────────────────────────────┤
-│  Key Components:                                            │
-│  • DualProviderClient: OpenRouter + Fireworks support      │
-│  • ComponentStore: JSON persistence for state             │
-│  • Structural Metrics: TreeBLEU, Container Match, TED       │
-│  • DOM Extraction: Playwright integration                   │
-│  • Image Processing: SSIM, color extraction, cropping       │
-└─────────────────────────────────────────────────────────────┘
+├── main.py                     # CLI entry point
+├── config.py                   # Configuration (providers, thresholds, codegen model)
+├── loop.py                     # Main orchestration loop (Phase 1 → 2 → 3)
+├── llm_client.py               # OpenAI-compatible HTTP client (OpenRouter/Fireworks)
+├── log.py                      # Logging setup
+│
+├── phases/
+│   ├── phase1_grouping/
+│   │   ├── element_detection.py    # Pre-step: detect all UI elements with bboxes
+│   │   ├── division.py             # 1.1: Partition into semantic regions
+│   │   ├── semantic.py             # 1.2: Label elements (label-only path)
+│   │   └── grouping.py            # 1.3: Build component tree
+│   │
+│   ├── phase2_codegen/
+│   │   ├── html_gen.py            # 2.1: Tree-to-HTML + VLLM fullpage codegen
+│   │   └── style_gen.py           # 2.2: Bbox-computed CSS + document assembly
+│   │
+│   └── phase3_refinement/
+│       ├── element_comparator.py  # Per-element closeup SSIM + VLLM analysis
+│       ├── repair.py              # Targeted component repair with closeup context
+│       ├── matcher.py             # (legacy) DOM-to-tree matching
+│       └── comparator.py          # (legacy) Per-component visual comparison
+│
+├── storage/
+│   └── component.py               # Data models (Component, Region, Element, Tree, etc.)
+│
+├── utils/
+│   ├── image.py                   # SSIM, color extraction, cropping, base64
+│   ├── dom.py                     # Playwright rendering, DOM tree extraction
+│   └── metrics.py                 # TreeBLEU, Container Match, Tree Edit Distance
+│
+├── tests/                         # 182 tests
+│   ├── test_phase1.py
+│   ├── test_phase2.py
+│   ├── test_phase3.py
+│   ├── test_metrics.py
+│   ├── test_storage.py
+│   └── test_utils.py
+│
+├── scripts/
+│   ├── debug_phase1.py            # Standalone Phase 1 debugging
+│   └── debug_phase2.py            # Standalone Phase 2 debugging
+│
+├── ui-inspo/                      # Input screenshots
+├── output/                        # Generated output
+├── requirements.txt
+└── .env                           # API keys (not committed)
 ```
 
 ## Configuration
 
-Create a `.env` file:
+Create a `.env` file (or copy `.env.example`):
 
 ```bash
 OPENROUTER_API_KEY=sk-or-v1-...
-FIREWORKS_API_KEY=fw-...
-DEFAULT_PROVIDER=openrouter
+FIREWORKS_API_KEY=fw-...          # optional, only if using fireworks provider
 ```
 
-Or set environment variables directly.
+Key config parameters (in `config.py`):
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `codegen_model` | `None` | VLLM model for single-shot codegen (e.g. `qwen/qwen-2.5-vl-72b-instruct`) |
+| `max_iterations` | 32 | Max Phase 3 refinement iterations |
+| `ssim_threshold` | 0.88 | Target SSIM to converge |
+| `per_component_threshold` | 0.90 | Per-element SSIM threshold for flagging issues |
+| `target_regions_min` / `max` | 3 / 10 | Region count bounds for Phase 1 |
+| `plateau_patience` | 2 | Iterations of no improvement before stopping |
 
 ## Evaluation Metrics
 
-The system tracks three structural metrics from the DesignCoder paper:
+Tracked per iteration:
 
-- **TreeBLEU** (0-1): Proportion of matching height-1 subtrees between generated and reference
-- **Container Match** (0-1): Percentage of containers with structurally equivalent matches
-- **Tree Edit Distance** (0+): Minimum operations needed to transform generated tree to reference
-
-Plus standard visual metrics:
-- **SSIM** (0-1): Structural similarity between screenshots
-- **MSE**: Mean squared pixel error
+| Metric | Range | Description |
+|--------|-------|-------------|
+| SSIM | 0-1 | Per-region structural similarity (mean across regions) |
+| Per-element SSIM | 0-1 | Closeup SSIM at each detected element bbox |
+| TreeBLEU | 0-1 | Proportion of matching height-1 subtrees |
+| Container Match | 0-1 | Percentage of containers with structurally equivalent matches |
+| Tree Edit Distance | 0+ | Min operations to transform generated tree to reference |
 
 ## Dependencies
 
-Core:
-- `aiohttp` - HTTP client for API calls
-- `playwright` - Browser automation for rendering
-- `pillow` - Image processing
-- `scikit-learn` - K-means clustering for color extraction
-- `scikit-image` - SSIM computation
-- `zss` - Tree edit distance (Zhang-Shasha algorithm)
-
-See `requirements.txt` for full list.
+```
+aiohttp          # Async HTTP for API calls
+playwright       # Browser rendering + DOM extraction
+pillow           # Image processing
+scikit-image     # SSIM computation
+scikit-learn     # K-means color extraction
+numpy            # Array ops
+zss              # Zhang-Shasha tree edit distance
+beautifulsoup4   # HTML parsing for targeted repair
+python-dotenv    # .env file loading
+```
 
 ## Design Decisions
 
-1. **No SDK Dependencies**: Pure HTTP requests to OpenRouter/Fireworks for flexibility
-2. **Standalone Operation**: Runs outside Hermes Agent for better image context handling
-3. **Async Throughout**: All API calls are async for performance
-4. **Dual Provider Support**: Can use different models for code gen vs vision tasks
-5. **Geometric Fallbacks**: Vision models can fail; geometric heuristics provide fallbacks
-6. **Per-Component Repair**: Targeted fixes instead of full rewrites for efficiency
+- **No SDK dependencies** for LLM calls — pure HTTP to OpenRouter/Fireworks for flexibility
+- **Plain CSS only** — no Tailwind utility classes, ever
+- **Element detection first** — regions are informed by where elements actually are, not guessed from visual appearance
+- **Label-only Phase 1.2** — bounding boxes from Phase 1.0 are preserved through semantic labeling, preventing coordinate drift
+- **Per-element closeup comparison** — catches issues that whole-page SSIM averages away (a 10px button misalignment barely moves global SSIM)
+- **Revert-if-worse** — if a repair iteration drops SSIM, the best HTML is restored and refinement stops
+- **Dual/triple provider support** — different models for code gen, vision analysis, and VLLM codegen
 
 ## Known Limitations
 
-1. **No Metadata**: Unlike original DesignCoder (Figma input), we work from raw screenshots only
-2. **Approximate Layout**: Bounding boxes give approximate sizes, not exact measurements
-3. **Vision Model Dependency**: Phase 1 quality depends on vision model's region detection
-4. **No Interactions**: Generates static HTML only (no JavaScript for interactive behaviors)
+- Works from raw screenshots only (no Figma metadata like original DesignCoder)
+- Bounding boxes give approximate sizes, not pixel-perfect measurements
+- Static HTML only (no JavaScript for interactive behaviors)
+- TreeBLEU and Container Match metrics currently report 0.0 (known issue, see FUTURE-005 in TODO.md)
+- Vision model quality directly impacts Phase 1 accuracy
 
 ## References
 
-- **DesignCoder** (Chen et al., 2025) - Hierarchy-aware UI code generation
-- **VIGA** - Write-run-render-compare-revise loop pattern
-- **abi/screenshot-to-code** - Single-pass baseline (~60k stars on GitHub)
-
-## Developer Tips
-
-### Debugging Phase 1 (Grouping)
-
-If region detection is poor:
-```python
-# Run just Phase 1
-python main.py ui-inspo/sample.png --phase 1
-
-# Check output/component_id/component.json for regions array
-# Check output/component_id/region_*.png for cropped images
-```
-
-### Debugging Phase 2 (Code Gen)
-
-If HTML structure is wrong:
-- Check `component.json` -> `tree` field for hierarchy
-- The tree should show parent-child relationships via `children_ids`
-- If tree is wrong, the issue is in Phase 1.3 (ComponentGrouping)
-- If tree is right but HTML is wrong, issue is in Phase 2.1 (HTMLGenerator)
-
-### Debugging Phase 3 (Refinement)
-
-If refinement isn't converging:
-```python
-# Check iteration history in component.json
-# Each iteration has: ssim, treebleu, container_match
-# Look for iterations where metrics don't improve (plateau)
-```
-
-### Common Issues
-
-**API Rate Limits**: Add delays between calls or reduce max_iterations
-
-**Vision Model Hallucination**: If regions don't match the image, try:
-- Lower temperature (0.2 instead of 0.3)
-- Different vision provider
-- Manual region specification (future feature)
-
-**Geometric Fallback**: If ComponentGrouping falls back to geometric mode often,
-the vision model is failing to parse the hierarchy prompt. Check:
-- Prompt clarity
-- Model capabilities (some vision models struggle with complex reasoning)
-- Element count (too many elements can overwhelm the model)
-
-### Adding New Element Types
-
-To add a new element type:
-1. Add to `VALID_TYPES` in `phases/phase1_grouping/semantic.py`
-2. Add mapping in `_normalize_type()` method
-3. Add HTML tag mapping in `phases/phase2_codegen/html_gen.py`
-4. Update prompts to mention the new type
-
-### Extending Metrics
-
-To add a new structural metric:
-1. Add function in `utils/metrics.py`
-2. Update `compute_all_metrics()` to include it
-3. Add to Iteration dataclass in `storage/component.py`
-4. Update output printing in `loop.py`
-
-## Testing Checklist
-
-Before claiming a component works:
-- [ ] Phase 1 produces 3-10 regions covering full image
-- [ ] Phase 1 crops are reasonable (not zero-size, within bounds)
-- [ ] Phase 2 HTML renders without errors
-- [ ] Phase 3 SSIM improves over iterations
-- [ ] Final output visually resembles reference
-- [ ] TreeBLEU > 0.5 (at least some hierarchy correct)
-
-## Performance Notes
-
-- Phase 1: ~3-5 API calls per region (one per subtask)
-- Phase 2: ~2 API calls per region
-- Phase 3: ~3 API calls per iteration (render is local)
-- Total: ~5-10 + (3 * iterations) calls per component
-
-## License
-
-MIT
+- **DesignCoder** (Chen et al., 2025) — Hierarchy-aware UI code generation
+- **VIGA** — Write-run-render-compare-revise loop pattern
+- **abi/screenshot-to-code** — Single-pass baseline comparison

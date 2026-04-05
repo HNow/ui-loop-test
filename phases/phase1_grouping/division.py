@@ -143,6 +143,11 @@ class UIDivision:
         # 6. Tighten regions: reassign orphans, drop empties, fit to elements
         regions = self._tighten_regions(regions, elements, width, height)
 
+        # 7. Resolve overlaps created by tightening
+        regions = self._resolve_post_tighten_overlaps(
+            regions, elements, width, height
+        )
+
         for i, region in enumerate(regions):
             print(f"  [1.1] Region {i}: {region.name} with {len(region.element_ids)} elements")
 
@@ -278,16 +283,15 @@ Respond with valid JSON only."""
         actual pixel coordinates if needed.
 
         Same heuristic as ElementDetector: if all right/bottom edges
-        are ≤ 1010 and the image exceeds 1000px, assume 0-1000.
+        are ≤ 1010, assume 0-1000 normalized coords.
         """
         if not regions:
             return regions
 
         max_right = max(b[0] + b[2] for _, b in regions)
         max_bottom = max(b[1] + b[3] for _, b in regions)
-        image_exceeds = img_width > 1000 or img_height > 1000
 
-        if max_right <= 1010 and max_bottom <= 1010 and image_exceeds:
+        if max_right <= 1010 and max_bottom <= 1010:
             sx = img_width / 1000.0
             sy = img_height / 1000.0
             return [
@@ -691,25 +695,8 @@ Respond with valid JSON only."""
         regions = [r for r in regions if r.element_ids]
 
         # 3. Tighten each region's bbox to its elements + padding
-        pad = self._REGION_PAD
         for r in regions:
-            bboxes = [
-                elem_by_id[eid].bbox
-                for eid in r.element_ids
-                if eid in elem_by_id
-            ]
-            if not bboxes:
-                continue
-            min_x = min(b[0] for b in bboxes)
-            min_y = min(b[1] for b in bboxes)
-            max_x = max(b[0] + b[2] for b in bboxes)
-            max_y = max(b[1] + b[3] for b in bboxes)
-            # Add padding, clamped to image bounds
-            min_x = max(0, min_x - pad)
-            min_y = max(0, min_y - pad)
-            max_x = min(img_width, max_x + pad)
-            max_y = min(img_height, max_y + pad)
-            r.bbox = (min_x, min_y, max_x - min_x, max_y - min_y)
+            self._retighten_single_region(r, elem_by_id, img_width, img_height)
 
         # Re-sort by y position and reassign IDs
         regions.sort(key=lambda r: r.bbox[1])
@@ -717,6 +704,163 @@ Respond with valid JSON only."""
             r.id = f"region_{i}"
 
         return regions
+
+    def _retighten_single_region(
+        self,
+        region: Region,
+        elem_by_id: dict,
+        img_width: int,
+        img_height: int,
+    ) -> None:
+        """Recompute a single region's bbox from its element bboxes + padding."""
+        bboxes = [
+            elem_by_id[eid].bbox
+            for eid in region.element_ids
+            if eid in elem_by_id
+        ]
+        if not bboxes:
+            return
+        pad = self._REGION_PAD
+        min_x = min(b[0] for b in bboxes)
+        min_y = min(b[1] for b in bboxes)
+        max_x = max(b[0] + b[2] for b in bboxes)
+        max_y = max(b[1] + b[3] for b in bboxes)
+        min_x = max(0, min_x - pad)
+        min_y = max(0, min_y - pad)
+        max_x = min(img_width, max_x + pad)
+        max_y = min(img_height, max_y + pad)
+        region.bbox = (min_x, min_y, max_x - min_x, max_y - min_y)
+
+    def _resolve_post_tighten_overlaps(
+        self,
+        regions: List[Region],
+        elements: List[DetectedElement],
+        img_width: int,
+        img_height: int,
+    ) -> List[Region]:
+        """
+        Resolve region overlaps that were created by _tighten_regions.
+
+        Two cases:
+        1. Full containment: smaller region is inside larger — remove
+           the smaller region's elements from the larger, retighten the larger.
+        2. Partial overlap (IoU > 0.3): split disputed elements by closest
+           centroid to region center, retighten both.
+        """
+        elem_by_id = {e.id: e for e in elements}
+
+        changed = True
+        while changed:
+            changed = False
+            for i in range(len(regions)):
+                for j in range(i + 1, len(regions)):
+                    ri, rj = regions[i], regions[j]
+                    # Determine which is smaller by area
+                    area_i = ri.bbox[2] * ri.bbox[3]
+                    area_j = rj.bbox[2] * rj.bbox[3]
+                    if area_i < area_j:
+                        r_small, r_big = ri, rj
+                    else:
+                        r_small, r_big = rj, ri
+
+                    if self._bbox_fully_contains(r_big.bbox, r_small.bbox):
+                        # Full containment: remove small's elements from big
+                        small_ids = set(r_small.element_ids)
+                        old_len = len(r_big.element_ids)
+                        r_big.element_ids = [
+                            eid for eid in r_big.element_ids
+                            if eid not in small_ids
+                        ]
+                        if len(r_big.element_ids) < old_len:
+                            self._retighten_single_region(
+                                r_big, elem_by_id, img_width, img_height
+                            )
+                            changed = True
+                            break
+                    elif self._bbox_iou(ri.bbox, rj.bbox) > 0.3:
+                        # Partial overlap: split disputed elements by centroid
+                        old_ids_i = set(ri.element_ids)
+                        old_ids_j = set(rj.element_ids)
+                        self._split_disputed_elements(
+                            ri, rj, elem_by_id, img_width, img_height
+                        )
+                        if set(ri.element_ids) != old_ids_i or set(rj.element_ids) != old_ids_j:
+                            changed = True
+                            break
+                if changed:
+                    break
+
+        # Drop regions with 0 elements, re-sort, reassign IDs
+        regions = [r for r in regions if r.element_ids]
+        regions.sort(key=lambda r: r.bbox[1])
+        for i, r in enumerate(regions):
+            r.id = f"region_{i}"
+        return regions
+
+    @staticmethod
+    def _bbox_fully_contains(
+        outer: Tuple[int, int, int, int],
+        inner: Tuple[int, int, int, int],
+    ) -> bool:
+        """Check if outer bbox fully contains inner bbox."""
+        ox, oy, ow, oh = outer
+        ix, iy, iw, ih = inner
+        return ix >= ox and iy >= oy and ix + iw <= ox + ow and iy + ih <= oy + oh
+
+    @staticmethod
+    def _bbox_iou(
+        a: Tuple[int, int, int, int],
+        b: Tuple[int, int, int, int],
+    ) -> float:
+        """Compute intersection-over-union of two bboxes."""
+        ax, ay, aw, ah = a
+        bx, by, bw, bh = b
+        ix = max(ax, bx)
+        iy = max(ay, by)
+        ix2 = min(ax + aw, bx + bw)
+        iy2 = min(ay + ah, by + bh)
+        if ix2 <= ix or iy2 <= iy:
+            return 0.0
+        inter = (ix2 - ix) * (iy2 - iy)
+        union = aw * ah + bw * bh - inter
+        return inter / union if union > 0 else 0.0
+
+    def _split_disputed_elements(
+        self,
+        r1: Region,
+        r2: Region,
+        elem_by_id: dict,
+        img_width: int,
+        img_height: int,
+    ) -> None:
+        """Split elements in the overlap zone by closest centroid to region center."""
+        # Find elements that appear in both regions
+        ids_1 = set(r1.element_ids)
+        ids_2 = set(r2.element_ids)
+        shared = ids_1 & ids_2
+        if not shared:
+            return
+
+        c1x = r1.bbox[0] + r1.bbox[2] / 2
+        c1y = r1.bbox[1] + r1.bbox[3] / 2
+        c2x = r2.bbox[0] + r2.bbox[2] / 2
+        c2y = r2.bbox[1] + r2.bbox[3] / 2
+
+        for eid in shared:
+            elem = elem_by_id.get(eid)
+            if not elem:
+                continue
+            ecx = elem.bbox[0] + elem.bbox[2] / 2
+            ecy = elem.bbox[1] + elem.bbox[3] / 2
+            d1 = ((ecx - c1x) ** 2 + (ecy - c1y) ** 2) ** 0.5
+            d2 = ((ecx - c2x) ** 2 + (ecy - c2y) ** 2) ** 0.5
+            if d1 <= d2:
+                r2.element_ids = [e for e in r2.element_ids if e != eid]
+            else:
+                r1.element_ids = [e for e in r1.element_ids if e != eid]
+
+        self._retighten_single_region(r1, elem_by_id, img_width, img_height)
+        self._retighten_single_region(r2, elem_by_id, img_width, img_height)
 
     def _centroid_distance(
         self, bbox1: Tuple[int, int, int, int], bbox2: Tuple[int, int, int, int]

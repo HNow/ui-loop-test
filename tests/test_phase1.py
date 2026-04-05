@@ -637,3 +637,125 @@ class TestLabelOnlyPath:
         assert stats["regions_label_only"] == 1
         assert stats["regions_redetect"] == 1
         assert stats["method"] == "mixed"
+
+
+class TestPostTightenOverlapResolution:
+    """Tests for _resolve_post_tighten_overlaps in UIDivision."""
+
+    def _make_division(self):
+        from phases.phase1_grouping.division import UIDivision
+        client = make_client()
+        cfg = make_config()
+        return UIDivision(client, cfg)
+
+    def test_full_containment_removes_nested_elements(self):
+        """When region B is fully inside region A, B's elements
+        should be removed from A's element list."""
+        div = self._make_division()
+
+        # Big region contains small region
+        r_big = Region(id="r0", name="form", bbox=(100, 100, 500, 800),
+                       element_ids=["e1", "e2", "e3", "e4"])
+        r_small = Region(id="r1", name="media", bbox=(120, 120, 300, 200),
+                         element_ids=["e2", "e3"])
+
+        elements = [
+            DetectedElement(id="e1", type="heading", bbox=(150, 400, 200, 30), text="Title"),
+            DetectedElement(id="e2", type="image", bbox=(150, 150, 250, 150), text=""),
+            DetectedElement(id="e3", type="chip", bbox=(200, 200, 80, 30), text="5 Days"),
+            DetectedElement(id="e4", type="button", bbox=(150, 700, 100, 40), text="Book"),
+        ]
+
+        result = div._resolve_post_tighten_overlaps(
+            [r_big, r_small], elements, 1200, 1500
+        )
+
+        # Both regions should survive
+        assert len(result) == 2
+
+        # Find the regions by name
+        big = next(r for r in result if r.name == "form")
+        small = next(r for r in result if r.name == "media")
+
+        # Big region should NOT contain e2, e3
+        assert "e2" not in big.element_ids
+        assert "e3" not in big.element_ids
+        assert "e1" in big.element_ids
+        assert "e4" in big.element_ids
+
+        # Small region keeps its elements
+        assert "e2" in small.element_ids
+        assert "e3" in small.element_ids
+
+    def test_full_containment_retightens_larger_region(self):
+        """After removing contained region's elements, the larger
+        region's bbox should shrink to fit remaining elements."""
+        div = self._make_division()
+
+        r_big = Region(id="r0", name="main", bbox=(100, 100, 500, 800),
+                       element_ids=["e1", "e2", "e3"])
+        r_small = Region(id="r1", name="media", bbox=(120, 120, 300, 200),
+                         element_ids=["e2"])
+
+        elements = [
+            DetectedElement(id="e1", type="button", bbox=(150, 600, 100, 40), text="Go"),
+            DetectedElement(id="e2", type="image", bbox=(150, 150, 250, 150), text=""),
+            DetectedElement(id="e3", type="text", bbox=(150, 700, 200, 30), text="Info"),
+        ]
+
+        result = div._resolve_post_tighten_overlaps(
+            [r_big, r_small], elements, 1200, 1500
+        )
+
+        big = next(r for r in result if r.name == "main")
+        # Big region's bbox should have moved down (no longer covers e2 area)
+        # e1 is at y=600, e3 is at y=700. With 30px padding:
+        # min_y should be around 570, not 100
+        assert big.bbox[1] > 500
+
+    def test_no_overlap_unchanged(self):
+        """Non-overlapping regions should pass through unchanged."""
+        div = self._make_division()
+
+        r1 = Region(id="r0", name="nav", bbox=(0, 0, 1200, 80),
+                     element_ids=["e1"])
+        r2 = Region(id="r1", name="body", bbox=(0, 100, 1200, 800),
+                     element_ids=["e2"])
+
+        elements = [
+            DetectedElement(id="e1", type="link", bbox=(10, 10, 80, 30), text="Home"),
+            DetectedElement(id="e2", type="text", bbox=(10, 200, 400, 30), text="Hello"),
+        ]
+
+        result = div._resolve_post_tighten_overlaps(
+            [r1, r2], elements, 1200, 1500
+        )
+
+        assert len(result) == 2
+        assert result[0].element_ids == ["e1"]
+        assert result[1].element_ids == ["e2"]
+
+    def test_empty_region_dropped(self):
+        """A region with 0 elements after overlap resolution
+        should be dropped."""
+        div = self._make_division()
+
+        # Big region has all elements, small region has the same elements
+        r_big = Region(id="r0", name="main", bbox=(0, 0, 1200, 1000),
+                       element_ids=["e1", "e2"])
+        r_small = Region(id="r1", name="sub", bbox=(100, 100, 200, 200),
+                         element_ids=["e1", "e2"])
+
+        elements = [
+            DetectedElement(id="e1", type="button", bbox=(120, 120, 80, 40), text="A"),
+            DetectedElement(id="e2", type="button", bbox=(120, 180, 80, 40), text="B"),
+        ]
+
+        result = div._resolve_post_tighten_overlaps(
+            [r_big, r_small], elements, 1200, 1500
+        )
+
+        # After removing small's elements from big, big has 0 elements
+        # and should be dropped. Small keeps both.
+        assert len(result) == 1
+        assert result[0].name == "sub"

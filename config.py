@@ -57,6 +57,7 @@ class Config:
 
     # Phase 2: Codegen — plain CSS only (no Tailwind)
     use_tailwind: bool = False
+    codegen_model: Optional[str] = None  # VLLM model for single-shot codegen (e.g. "qwen/qwen-2.5-vl-72b-instruct")
 
     # Phase 3: Refinement
     per_component_threshold: float = 0.90  # SSIM threshold for per-component match
@@ -68,6 +69,16 @@ class Config:
     def __post_init__(self):
         # Ensure output directory exists
         self.output_dir.mkdir(parents=True, exist_ok=True)
+
+    def get_codegen_llm_config(self) -> Optional[LLMConfig]:
+        """Get LLM config for VLLM codegen, or None if codegen_model is not set."""
+        if not self.codegen_model:
+            return None
+        base = self.get_llm_config(for_vision=True)
+        base.model = self.codegen_model
+        base.vision_model = self.codegen_model
+        base.max_tokens = 16384  # Full-page HTML needs more tokens
+        return base
 
     def get_llm_config(self, for_vision: bool = False) -> LLMConfig:
         """Get LLM config for the active provider."""

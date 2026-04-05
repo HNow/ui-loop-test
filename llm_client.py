@@ -202,19 +202,31 @@ class LLMClient:
 class DualProviderClient:
     """Manages separate clients for code gen and vision tasks."""
 
-    def __init__(self, code_config: LLMConfig, vision_config: LLMConfig):
+    def __init__(
+        self,
+        code_config: LLMConfig,
+        vision_config: LLMConfig,
+        codegen_config: Optional[LLMConfig] = None,
+    ):
         self.code_client = LLMClient(code_config)
         self.vision_client = LLMClient(vision_config)
+        self.codegen_client: Optional[LLMClient] = (
+            LLMClient(codegen_config) if codegen_config else None
+        )
 
     async def __aenter__(self):
         await self.code_client.__aenter__()
         await self.vision_client.__aenter__()
+        if self.codegen_client:
+            await self.codegen_client.__aenter__()
         return self
 
     async def __aexit__(self, exc_type, exc_val, exc_tb):
-        """Close both clients on context exit."""
+        """Close all clients on context exit."""
         await self.code_client.__aexit__(exc_type, exc_val, exc_tb)
         await self.vision_client.__aexit__(exc_type, exc_val, exc_tb)
+        if self.codegen_client:
+            await self.codegen_client.__aexit__(exc_type, exc_val, exc_tb)
 
     async def code_complete(self, messages: List[Message], **kwargs) -> LLMResponse:
         """Use code generation model."""
@@ -225,3 +237,10 @@ class DualProviderClient:
     ) -> LLMResponse:
         """Use vision model for image analysis."""
         return await self.vision_client.vision_complete(prompt, images, **kwargs)
+
+    async def codegen_from_vision(
+        self, prompt: str, images: List[Union[str, Path]], **kwargs
+    ) -> LLMResponse:
+        """Use VLLM codegen model for full-page HTML generation from screenshot."""
+        client = self.codegen_client or self.vision_client
+        return await client.vision_complete(prompt, images, **kwargs)

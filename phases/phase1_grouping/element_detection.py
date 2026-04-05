@@ -264,13 +264,12 @@ Respond with valid JSON only. Include every element you can see."""
             return elements
 
         # Heuristic: if every right-edge (x+w) and bottom-edge (y+h)
-        # is ≤ 1010 (small tolerance) AND the image exceeds 1000px in
-        # at least one dimension, assume 0-1000 normalized coords.
+        # is ≤ 1010 (small tolerance), assume 0-1000 normalized coords.
+        # The model always returns 0-1000 coords regardless of image size.
         max_right = max(e.bbox[0] + e.bbox[2] for e in elements)
         max_bottom = max(e.bbox[1] + e.bbox[3] for e in elements)
-        image_exceeds = img_width > 1000 or img_height > 1000
 
-        if max_right <= 1010 and max_bottom <= 1010 and image_exceeds:
+        if max_right <= 1010 and max_bottom <= 1010:
             sx = img_width / 1000.0
             sy = img_height / 1000.0
             for elem in elements:
